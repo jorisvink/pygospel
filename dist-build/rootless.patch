@@ -1,0 +1,86 @@
+Run a sanctum cathedral without privileges, for tests only.
+
+A cathedral needs no tunnel interface and no packets of its own, it only
+answers offers, so the three things standing between it and an ordinary
+user are all privilege dropping:
+
+  - sanctum_proc_create() looks up the runas user of every worker and
+    dies when it cannot, here it falls back to our own uid and gid
+  - sanctum_proc_privsep() setuid()s into that user, skipped unprivileged
+  - the linux sandbox unshares a network namespace for control, which
+    needs CAP_SYS_ADMIN, so an unprivileged cathedral keeps the one it has
+
+Every guard is keyed off geteuid(), so nothing changes for a root run.
+This is a test build, do not point a real flock at it.
+
+
+diff -ru a/src/platform_linux.c b/src/platform_linux.c
+--- a/src/platform_linux.c	2026-11-04 12:00:00.000000000 +0100
++++ b/src/platform_linux.c	2026-11-04 12:00:00.000000000 +0100
+@@ -710,6 +710,15 @@
+ 	    proc->type != SANCTUM_PROC_PURGATORY_TX &&
+ 	    proc->type != SANCTUM_PROC_CATHEDRAL &&
+ 	    proc->type != SANCTUM_PROC_LITURGY) {
++
++		/*
++		 * TEST BUILD ONLY: a new netns needs privileges, so an
++		 * unprivileged cathedral simply keeps the one it has.
++		 */
++
++		if (geteuid() != 0)
++			return;
++
+ 		if (unshare(CLONE_NEWNET) == -1)
+ 			fatal("unshare: %s", errno_s);
+ 	}
+diff -ru a/src/proc.c b/src/proc.c
+--- a/src/proc.c	2026-11-04 12:00:00.000000000 +0100
++++ b/src/proc.c	2026-11-04 12:00:00.000000000 +0100
+@@ -245,9 +245,6 @@
+ 	PRECOND(entry != NULL);
+ 	/* arg is optional. */
+ 
+-	if (sanctum->runas[type] == NULL)
+-		fatal("no runas user configured for %s", proctab[type]);
+-
+ 	if ((proc = calloc(1, sizeof(*proc))) == NULL)
+ 		fatal("calloc: failed to allocate new proc entry");
+ 
+@@ -256,11 +253,20 @@
+ 	proc->entry = entry;
+ 	proc->name = proctab[type];
+ 
+-	if ((pw = getpwnam(sanctum->runas[proc->type])) == NULL)
+-		fatal("getpwnam(%s): %s", sanctum->runas[proc->type], errno_s);
+-
+-	proc->uid = pw->pw_uid;
+-	proc->gid = pw->pw_gid;
++	/*
++	 * TEST BUILD ONLY: without privileges we cannot switch users, so we
++	 * run every worker as ourselves. A real deployment must have a
++	 * runas user for each process and must be able to drop to it.
++	 */
++
++	if (geteuid() != 0 || sanctum->runas[type] == NULL ||
++	    (pw = getpwnam(sanctum->runas[proc->type])) == NULL) {
++		proc->uid = getuid();
++		proc->gid = getgid();
++	} else {
++		proc->uid = pw->pw_uid;
++		proc->gid = pw->pw_gid;
++	}
+ 
+ 	if ((proc->pid = fork()) == -1)
+ 		fatal("failed to fork child: %s", errno_s);
+@@ -328,6 +334,11 @@
+ 		fatal("%s: unknown process type %d", __func__, proc->type);
+ 	}
+ 
++	/* TEST BUILD ONLY: see sanctum_proc_create(). */
++
++	if (geteuid() != 0)
++		return;
++
+ 	if (setgroups(1, &proc->gid) == -1 ||
+ 	    setgid(proc->gid) == -1 || setegid(proc->gid) == -1 ||
+ 	    setuid(proc->uid) == -1 || seteuid(proc->uid) == -1)

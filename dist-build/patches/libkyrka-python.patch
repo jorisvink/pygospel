@@ -1,0 +1,238 @@
+Make the libkyrka python module useful for gospel chats:
+
+  - expose kyrka_cathedral_liturgy(), gospel needs it to tell a cathedral
+    which peers it wants and to enumerate the members of a group
+  - hand the liturgy peer list, the remembrance cathedrals and the peer
+    discovery flags to the python event callback, gospel needs all three
+  - pykyrka_version() is METH_NOARGS, its args PRECOND aborted
+
+diff -ru a/src/python.c b/src/python.c
+--- a/src/python.c	2026-11-04 12:00:00.000000000 +0100
++++ b/src/python.c	2026-11-04 12:00:00.000000000 +0100
+@@ -79,6 +79,7 @@
+ 
+ static PyObject		*pykyrka_cathedral_notify(PyObject *, PyObject *);
+ static PyObject		*pykyrka_cathedral_cosk_load(PyObject *, PyObject *);
++static PyObject		*pykyrka_cathedral_liturgy(PyObject *, PyObject *);
+ static PyObject		*pykyrka_cathedral_secret_load(PyObject *, PyObject *);
+ static PyObject		*pykyrka_cathedral_nat_detection(PyObject *,
+ 			    PyObject *);
+@@ -104,6 +105,8 @@
+ 			    const char *, const char *);
+ static int		python_dict_add_uint64(PyObject *,
+ 			    const char *, u_int64_t);
++static int		python_dict_add_bytes(PyObject *,
++			    const char *, const u_int8_t *, size_t);
+ 
+ static int		python_uint8_from_dict(PyObject *,
+ 			    const char *, u_int8_t *);
+@@ -140,6 +143,8 @@
+ 	    pykyrka_cathedral_secret_load, METH_VARARGS),
+ 	METHOD("cathedral_cosk_load",
+ 	    pykyrka_cathedral_cosk_load, METH_VARARGS),
++	METHOD("cathedral_liturgy",
++	    pykyrka_cathedral_liturgy, METH_VARARGS),
+ 	METHOD("cathedral_configure",
+ 	    pykyrka_cathedral_configure, METH_VARARGS | METH_KEYWORDS),
+ 	METHOD("cathedral_nat_detection", pykyrka_cathedral_nat_detection,
+@@ -190,6 +195,7 @@
+ 	CONSTANT(KYRKA_EVENT_AMBRY_RECEIVED),
+ 	CONSTANT(KYRKA_EVENT_LITURGY_RECEIVED),
+ 	CONSTANT(KYRKA_EVENT_REMEMBRANCE_RECEIVED),
++	CONSTANT(KYRKA_EVENT_LOGMSG),
+ 	{ NULL, -1, NULL },
+ };
+ 
+@@ -204,6 +210,7 @@
+ 	CONSTANT(KYRKA_PACKET_SHROUD_PEER),
+ 	CONSTANT(KYRKA_PACKET_SHROUD_CATHEDRAL),
+ 	CONSTANT(KYRKA_CATHEDRAL_LITURGY_MAGIC),
++	CONSTANT(KYRKA_INFO_FLAG_SAME_EXTERNAL_IPV4),
+ 	{ NULL, -1, NULL },
+ };
+ 
+@@ -274,6 +281,68 @@
+ 	exit(1);
+ }
+ 
++static int		remembrance_cathedrals(PyObject *,
++			    const struct kyrka_event_remembrance *);
++
++/*
++ * Turn the cathedrals of a remembrance into a list of (ip, port) tuples,
++ * the ip in the same host order integer the peer discovery event uses.
++ */
++static int
++remembrance_cathedrals(PyObject *dict,
++    const struct kyrka_event_remembrance *rem)
++{
++	int			i;
++	PyObject		*list, *entry, *obj;
++
++	PRECOND(dict != NULL);
++	PRECOND(rem != NULL);
++
++	if ((list = PyList_New(0)) == NULL)
++		return (-1);
++
++	for (i = 0; i < KYRKA_CATHEDRALS_MAX; i++) {
++		if (rem->ips[i] == 0)
++			continue;
++
++		if ((entry = PyTuple_New(2)) == NULL)
++			goto failure;
++
++		if ((obj = PyLong_FromUnsignedLongLong(rem->ips[i])) == NULL) {
++			Py_DECREF(entry);
++			goto failure;
++		}
++
++		PyTuple_SET_ITEM(entry, 0, obj);
++
++		if ((obj = PyLong_FromUnsignedLongLong(rem->ports[i])) == NULL) {
++			Py_DECREF(entry);
++			goto failure;
++		}
++
++		PyTuple_SET_ITEM(entry, 1, obj);
++
++		if (PyList_Append(list, entry) == -1) {
++			Py_DECREF(entry);
++			goto failure;
++		}
++
++		Py_DECREF(entry);
++	}
++
++	if (PyDict_SetItemString(dict, "cathedrals", list) == -1)
++		goto failure;
++
++	Py_DECREF(list);
++
++	return (0);
++
++failure:
++	Py_DECREF(list);
++
++	return (-1);
++}
++
+ /*
+  * Internal event callback for all allocated KYRKA contexts that based on the
+  * event creates a python dict populated with relevant data.
+@@ -327,6 +396,8 @@
+ 			goto cleanup;
+ 		if (python_dict_add_uint64(info, "port", evt->peer.port) == -1)
+ 			goto cleanup;
++		if (python_dict_add_uint64(info, "flags", evt->peer.flags) == -1)
++			goto cleanup;
+ 		break;
+ 	case KYRKA_EVENT_AMBRY_RECEIVED:
+ 		if (python_dict_add_uint64(info,
+@@ -334,8 +405,14 @@
+ 			goto cleanup;
+ 		break;
+ 	case KYRKA_EVENT_LITURGY_RECEIVED:
++		if (python_dict_add_bytes(info, "peers",
++		    evt->liturgy.peers, sizeof(evt->liturgy.peers)) == -1)
++			goto cleanup;
+ 		break;
+ 	case KYRKA_EVENT_REMEMBRANCE_RECEIVED:
++		if (remembrance_cathedrals(info,
++		    &evt->remembrance) == -1)
++			goto cleanup;
+ 		break;
+ 	default:
+ 		PyErr_Format(PyExc_RuntimeError,
+@@ -423,7 +500,6 @@
+ 	PyObject	*version;
+ 
+ 	PRECOND(self != NULL);
+-	PRECOND(args != NULL);
+ 
+ 	if ((version = PyUnicode_FromString(kyrka_version())) == NULL)
+ 		return (PyErr_NoMemory());
+@@ -676,6 +752,49 @@
+ }
+ 
+ /*
++ * Entry from python for an allocated context cathedral_liturgy().
++ *
++ * Without arguments we are interested in all peers of our flock, with
++ * a KYRKA_PEERS_PER_FLOCK byte long object we tell the cathedral which
++ * peers we want to hear about.
++ */
++static PyObject *
++pykyrka_cathedral_liturgy(PyObject *self, PyObject *args)
++{
++	Py_buffer		buf;
++	struct pykyrka		*ctx;
++	int			ret;
++
++	PRECOND(self != NULL);
++	PRECOND(args != NULL);
++
++	memset(&buf, 0, sizeof(buf));
++
++	if (!PyArg_ParseTuple(args, "|y*", &buf))
++		return (NULL);
++
++	ctx = (struct pykyrka *)self;
++
++	if (buf.obj != NULL && buf.len != KYRKA_PEERS_PER_FLOCK) {
++		PyBuffer_Release(&buf);
++		PyErr_Format(PyExc_RuntimeError, "peers must be %u bytes",
++		    (unsigned int)KYRKA_PEERS_PER_FLOCK);
++		return (NULL);
++	}
++
++	ret = kyrka_cathedral_liturgy(ctx->kyrka, buf.buf, buf.len);
++
++	PyBuffer_Release(&buf);
++
++	if (ret == -1) {
++		python_kyrka_exception(kyrka_last_error(ctx->kyrka));
++		return (NULL);
++	}
++
++	Py_RETURN_TRUE;
++}
++
++/*
+  * Entry from python for an allocated context cathedral_secret_load().
+  */
+ static PyObject *
+@@ -1250,6 +1369,33 @@
+ 
+ 	return (0);
+ }
++
++/*
++ * Helper function to add a bytes object built from the given buffer to
++ * a dict under the given key.
++ */
++static int
++python_dict_add_bytes(PyObject *dict, const char *name,
++    const u_int8_t *data, size_t len)
++{
++	PyObject	*obj;
++
++	PRECOND(dict != NULL);
++	PRECOND(name != NULL);
++	PRECOND(data != NULL);
++
++	if ((obj = PyBytes_FromStringAndSize((const char *)data, len)) == NULL)
++		return (-1);
++
++	if (PyDict_SetItemString(dict, name, obj) == -1) {
++		Py_DECREF(obj);
++		return (-1);
++	}
++
++	Py_DECREF(obj);
++
++	return (0);
++}
+ 
+ /*
+  * Helper function to push a constant uint64 value into the module
