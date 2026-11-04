@@ -12,7 +12,7 @@ PYSITE?=$(shell $(PYTHON) -c \
     'import sysconfig; print(sysconfig.get_path("purelib"))')
 
 SRC=	src/pygospel.py
-TESTS=	tests/gospel_test.py
+TESTS=	tests/gospel_test.py tests/agent_test.py
 TOOLS=	examples/chatter.py examples/echo.py examples/presence.py \
 	examples/agent.py
 
@@ -28,7 +28,7 @@ install: all
 	install -m 555 $(PYMOD)/libkyrka.so $(DESTDIR)$(PYSITE)
 
 test:
-	@$(PYTHON) $(TESTS)
+	@for t in $(TESTS); do $(PYTHON) $$t || exit 1; done
 
 smoke: python-mod
 	@PYTHONPATH=$(PYMOD):src $(PYTHON) tests/smoke.py

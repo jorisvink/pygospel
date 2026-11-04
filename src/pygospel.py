@@ -1,10 +1,11 @@
 """
-Text-only gospel chats, driven by the libkyrka python module.
+Gospel chats, driven by the libkyrka python module.
 
 Gospel is the protocol Vigil uses for calls and messages over sanctum
-tunnels. This module speaks the text part of it and nothing else: it sends
-and receives text messages in one-to-one chats and in group chats, it is
-compatible with Vigil and with confession, and it claims no other ability.
+tunnels. This module speaks the chat part of it: it sends and receives text
+messages and sends images, in one-to-one chats and in group chats. It is
+compatible with Vigil and with confession. It cannot receive data and it
+claims no other ability.
 
 The fastest way in:
 
@@ -38,6 +39,7 @@ on the Message once it has kept it.
 
 import os
 import re
+import stat
 import sys
 import time
 import socket
@@ -124,6 +126,20 @@ HEARTBEAT_MIN  = HEARTBEAT_UID + HEARTBEAT_BODY.size
 REPLY_HEAD = struct.Struct("!BQ")
 REPLY_MAX  = MESSAGE_MAX - REPLY_HEAD.size
 
+# Data goes out as chunks, told apart from a frame by their size. The blob
+# they carve up starts with a head that says what it is and what it is called.
+DATA_IMAGE    = 1
+DATA_NAME_MAX = 126
+DATA_MAX      = 4096 * 1024
+DATA_HEAD     = struct.Struct("!BB%ds" % DATA_NAME_MAX)
+DATA_ACK_HEAD = struct.Struct("!II")
+CHUNK_DATA    = 1152
+CHUNK_HEAD    = struct.Struct("!QIII")
+
+# What a peer that takes no data gets instead, the same words Vigil uses.
+DATA_NOTICE = ("I sent you an image, but you are on gospel so you cannot open "
+    "it, too bad.")
+
 # Flock domains. One-to-one chats and group chats live in different ones, so
 # the same two devices never share a key between a direct chat and a group.
 CALL_DOMAIN  = 0x0a
@@ -184,6 +200,18 @@ P2P_SILENT             = 1 * 1000
 HOLEPUNCH              = 10 * 1000
 HOLEPUNCH_INTERVAL     = 1 * 1000
 STORE_WAIT             = 10 * 1000
+DATA_PROBE             = 2 * 1000
+DATA_STALL             = 20 * 1000
+RTT_START              = 300
+
+# Chunks per second, and how many we send in one go.
+RATE_START  = 200
+RATE_MIN    = 50
+RATE_MAX    = 8000
+CHUNK_BURST = 48
+
+# How long the loop may sleep in seconds while data is on its way.
+BUSY_POLL = 0.01
 
 # Where a Vigil configuration ends up if it does not say.
 MTU_DEFAULT = 1408
@@ -264,6 +292,42 @@ def _normalize(data):
         idx += need + 1
 
     return bytes(out)
+
+
+def image_type(data):
+    """The kind of image these bytes hold if every Vigil can show it."""
+
+    if data[:8] == b"\x89PNG\r\n\x1a\n":
+        return "png"
+    if data[:3] == b"\xff\xd8\xff":
+        return "jpg"
+    if data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+
+    return None
+
+
+def _data_name(name):
+    """The name as bytes, if it is a plain file name Vigil will accept."""
+
+    if not isinstance(name, str):
+        raise GospelError("an image name is a str")
+
+    raw = _normalize(name.encode("utf-8"))
+
+    if not raw or len(raw) > DATA_NAME_MAX:
+        raise GospelError("an image name is 1 to %d bytes" % DATA_NAME_MAX)
+
+    if raw[:1] == b".":
+        raise GospelError("an image name does not start with a dot")
+
+    for byte in raw:
+        if byte < 0x20 or byte == 0x7f or byte in b"/\\":
+            raise GospelError("%r is not a plain file name" % name)
+
+    return raw
 
 
 def _mentions(text, names):
@@ -614,6 +678,7 @@ class Message:
                     back to you in on_sent and on_delivered
         id          the wire id, only meaningful on the tunnel it rode
         hash        the digest of the text, what a reply points at
+        name        the file name if this is an image we send, else None
         quote       the Quote this message answers, or None; its author is a
                 device id, ours if we wrote the message being answered
         author      who wrote it: our own spi, or the peer that sent it
@@ -623,7 +688,7 @@ class Message:
     """
 
     __slots__ = ("text", "peer", "group", "ref", "id", "hash", "quote",
-        "author", "ts", "delivered", "_chat", "_ack")
+        "author", "ts", "delivered", "name", "_chat", "_ack")
 
     def __init__(self, text="", peer=0, group=None, ref=0, quote=None,
         author=None):
@@ -637,6 +702,7 @@ class Message:
         self.author = peer if author is None else author
         self.ts = time.time()
         self.delivered = False
+        self.name = None
         self._chat = None
         self._ack = None
 
@@ -798,13 +864,15 @@ class _Seen:
 class _Held:
     """A message we hold for a peer until its copy has been acked."""
 
-    __slots__ = ("ref", "text", "quote", "msgid", "age", "pending", "sent",
-        "group", "tally", "delivered")
+    __slots__ = ("ref", "text", "quote", "blob", "name", "msgid", "age",
+        "pending", "sent", "group", "tally", "delivered")
 
-    def __init__(self, ref, text, quote=None):
+    def __init__(self, ref, text, quote=None, blob=None, name=None):
         self.ref = ref
         self.text = text
         self.quote = quote
+        self.blob = blob
+        self.name = name
         self.msgid = 0
         self.age = 0
         self.pending = False
@@ -812,6 +880,79 @@ class _Held:
         self.group = None
         self.tally = None
         self.delivered = False
+
+
+class _Xfer:
+    """How far along a held blob is on its way to the peer of a tunnel."""
+
+    __slots__ = ("held", "count", "acked", "sent", "base", "next", "scan",
+        "done", "probe", "tick", "last_ack", "rtt", "rtt_min", "rate",
+        "credit")
+
+    def __init__(self, held, now):
+        self.held = held
+        self.count = (len(held.blob) + CHUNK_DATA - 1) // CHUNK_DATA
+        self.acked = bytearray(self.count)
+        self.sent = [0] * self.count
+        self.base = 0
+        self.next = 0
+        self.scan = 0
+        self.done = False
+        self.probe = 0
+        self.tick = now
+        self.last_ack = now
+        self.rtt = RTT_START
+        self.rtt_min = 0
+        self.rate = RATE_START
+        self.credit = 0
+
+    def restart(self, now):
+        self.acked = bytearray(self.count)
+        self.sent = [0] * self.count
+        self.base = 0
+        self.next = 0
+        self.credit = 0
+        self.rtt_min = 0
+        self.rtt = RTT_START
+        self.rate = RATE_START
+        self.last_ack = now
+
+    def pick(self, now):
+        """The next chunk to send, an old one first, None if there is none."""
+
+        rto = self.rtt + self.rtt // 2 + 30
+
+        while self.scan < self.next:
+            idx = self.scan
+            self.scan += 1
+
+            if not self.acked[idx] and now - self.sent[idx] >= rto:
+                return idx
+
+        if self.next >= self.count:
+            return None
+
+        flight = (self.rate * self.rtt * 2) // 1000 + CHUNK_BURST
+
+        if self.next - self.base >= flight:
+            return None
+
+        self.next += 1
+
+        return self.next - 1
+
+    def pace(self, rtt):
+        """Adjust the rate to the round trip time we just saw."""
+
+        if self.rtt_min == 0 or rtt < self.rtt_min:
+            self.rtt_min = rtt
+
+        self.rtt = (self.rtt * 7 + rtt) // 8
+
+        if rtt <= self.rtt_min + self.rtt_min // 4 + 10:
+            self.rate = min(self.rate + self.rate // 8 + 8, RATE_MAX)
+        elif rtt > self.rtt_min * 2 + 20:
+            self.rate = max(self.rate - self.rate // 8, RATE_MIN)
 
 
 class _Tally:
@@ -965,6 +1106,7 @@ class _Tunnel:
 
         self.sendq = []
         self.waitq = []
+        self.xfer = None
         self.seen = [_Seen() for _ in range(SEEN_MAX)]
         self.seen_next = 0
 
@@ -1027,6 +1169,11 @@ class _Tunnel:
 
         held.msgid = self.next_msgid
         self.next_msgid += 1
+
+        # A blob leaves as chunks, see _xfer_run().
+        if held.blob is not None:
+            held.age = _ms()
+            return
 
         # Replies wait until we know if our peer takes them, see _resend().
         if held.quote is not None and held.quote.hash != 0 and not self.heard:
@@ -1097,6 +1244,7 @@ class _Tunnel:
             return
 
         self._resend(now)
+        self._xfer_run(now)
 
         typed = self.chat.group_typing if self.is_group \
             else self.peer.typing_out
@@ -1121,7 +1269,7 @@ class _Tunnel:
         """Queue again whatever we sent and never heard anything about."""
 
         for held in list(self._held()):
-            if held.pending or held.msgid == 0:
+            if held.pending or held.msgid == 0 or held.blob is not None:
                 continue
             if now - held.age < RESEND_INTERVAL:
                 continue
@@ -1130,6 +1278,116 @@ class _Tunnel:
 
             held.pending = True
             self.sendq.append(held)
+
+    def _xfer_run(self, now):
+        """Start on the next blob if the peer takes them, then send chunks."""
+
+        if self.xfer is None:
+            if not self.heard:
+                return
+
+            for held in list(self._held()):
+                if held.blob is None or held.msgid == 0:
+                    continue
+
+                if self.features & FEATURE_DATA:
+                    self.xfer = _Xfer(held, now)
+                    break
+
+                held.blob = None
+                held.pending = True
+                self.sendq.append(held)
+
+            if self.xfer is None:
+                return
+
+        self._xfer_pump(now)
+
+    def _xfer_pump(self, now):
+        """
+        Send as many chunks as the rate allows. Once our peer has all of them
+        the first one goes out now and then to get an ack out of it.
+        """
+
+        xfer = self.xfer
+
+        if xfer.done:
+            if now >= xfer.probe:
+                xfer.probe = now + DATA_PROBE
+                self._chunk_send(0, now)
+            return
+
+        if now - xfer.last_ack > DATA_STALL:
+            xfer.restart(now)
+
+        xfer.credit += (now - xfer.tick) * xfer.rate
+        xfer.credit = min(xfer.credit, CHUNK_BURST * 1000)
+        xfer.tick = now
+        xfer.scan = xfer.base
+
+        for _ in range(CHUNK_BURST):
+            if xfer.credit < 1000:
+                break
+
+            idx = xfer.pick(now)
+
+            if idx is None:
+                break
+
+            self._chunk_send(idx, now)
+            xfer.credit -= 1000
+
+    def _chunk_send(self, idx, now):
+        xfer = self.xfer
+        held = xfer.held
+        data = held.blob[idx * CHUNK_DATA:(idx + 1) * CHUNK_DATA]
+
+        self.send_frame(CHUNK_HEAD.pack(held.msgid, idx, xfer.count,
+            len(held.blob)) + data.ljust(CHUNK_DATA, b"\x00"))
+
+        xfer.sent[idx] = now
+
+        if not held.sent and not self.is_group:
+            held.sent = True
+            self.chat._emit("on_sent", held.ref,
+                self.chat._message_of(held, self.peer.id, None))
+
+    def _on_data_ack(self, msgid, length, payload):
+        """Our peer told us which chunks of the blob it has."""
+
+        xfer = self.xfer
+
+        if xfer is None or xfer.held.msgid != msgid:
+            return
+
+        if length != MESSAGE_MAX:
+            return
+
+        base, latest = DATA_ACK_HEAD.unpack_from(payload, 0)
+        bits = payload[DATA_ACK_HEAD.size:MESSAGE_MAX]
+
+        if base > xfer.count:
+            return
+
+        for idx in range(xfer.base, base):
+            xfer.acked[idx] = 1
+
+        for idx in range(min(len(bits) * 8, xfer.count - base - 1)):
+            if bits[idx // 8] & (1 << (idx % 8)):
+                xfer.acked[base + 1 + idx] = 1
+
+        xfer.base = max(xfer.base, base)
+        xfer.next = max(xfer.next, xfer.base)
+
+        now = _ms()
+        xfer.last_ack = now
+
+        if latest < xfer.count and xfer.sent[latest] != 0:
+            xfer.pace(now - xfer.sent[latest])
+
+        if xfer.base >= xfer.count and not xfer.done:
+            xfer.done = True
+            xfer.probe = now + DATA_PROBE
 
     #
     # Getting things in.
@@ -1154,7 +1412,8 @@ class _Tunnel:
             self._on_ack(msgid)
         elif ftype == TYPE_HEARTBEAT:
             self._on_heartbeat(payload)
-        # Frames carrying data are not ours, we never asked to receive any.
+        elif ftype == TYPE_DATA_ACK:
+            self._on_data_ack(msgid, length, payload)
 
     def _on_heartbeat(self, payload):
         uid, nick, typing, features, instance, signature = \
@@ -1267,6 +1526,9 @@ class _Tunnel:
             if held in self.sendq:
                 self.sendq.remove(held)
 
+            if self.xfer is not None and self.xfer.held is held:
+                self.xfer = None
+
             self._held().remove(held)
             held.delivered = True
 
@@ -1365,6 +1627,7 @@ class _Tunnel:
             return
 
         self.closed = True
+        self.xfer = None
 
         for held in self.sendq:
             held.pending = False
@@ -1387,7 +1650,7 @@ class _Tunnel:
 
 class GospelChat:
     """
-    A text-only gospel chat.
+    A gospel chat: text both ways, images out.
 
     Arguments:
         config      a GospelConfig, the path to a Vigil configuration file,
@@ -1602,6 +1865,72 @@ class GospelChat:
 
         return self.send_group(text, ref, self._quote_of(to))
 
+    def send_image(self, peer, image, name=None, ref=None):
+        """
+        Send an image to a device: a path, or the bytes of a PNG, JPEG, GIF
+        or WebP of at most 4 MiB. name is the file name it arrives under,
+        by default that of the path.
+
+        It waits in the outbox like a message does, on_sent and on_delivered
+        follow it. A peer that takes no data gets a notice saying so instead.
+        """
+
+        self._check_peer(peer)
+        blob, name = self._image_blob(image, name)
+
+        held = self._hold(peer, DATA_NOTICE, None, ref, blob, name)
+        tunnel = self.peer(peer).signal_tunnel
+
+        if tunnel is not None and held.msgid == 0:
+            tunnel._queue(held)
+
+        self._signal()
+
+        return self._message_of(held, peer, None)
+
+    def send_group_image(self, image, name=None, ref=None):
+        """
+        Send an image to every member of our group that is online at this
+        moment. on_group_delivered follows as they ack it.
+        """
+
+        if self.group == 0:
+            raise GospelError("we are not in a group")
+
+        blob, name = self._image_blob(image, name)
+        tally = _Tally(self._new_ref(ref), self.group)
+
+        for id in sorted(self.peers):
+            target = self.peers[id]
+
+            if id == self.spi or not target.member:
+                continue
+
+            tunnel = target.group_tunnel
+
+            if tunnel is None or not tunnel.alive:
+                continue
+
+            held = _Held(tally.ref, DATA_NOTICE, None, blob, name)
+            held.tally = tally
+            held.group = self.group
+            tally.pending += 1
+
+            tunnel.waitq.append(held)
+            tunnel._queue(held)
+
+        if tally.pending == 0:
+            raise GospelError("no member of the group is online")
+
+        self.tallies.append(tally)
+
+        msg = Message(DATA_NOTICE, peer=self.spi, group=self.group,
+            ref=tally.ref, author=self.spi)
+        msg.name = name
+        msg._chat = self
+
+        return msg
+
     def join(self, group):
         """
         Join the group with the given 16 bit id, leaving the one we are in.
@@ -1682,6 +2011,9 @@ class GospelChat:
         for held in list(target.outbox):
             if tunnel is not None and held in tunnel.sendq:
                 tunnel.sendq.remove(held)
+            if tunnel is not None and tunnel.xfer is not None and \
+                tunnel.xfer.held is held:
+                tunnel.xfer = None
             target.outbox.remove(held)
 
     def peer(self, id):
@@ -1812,6 +2144,9 @@ class GospelChat:
 
     def poll(self, timeout=1.0):
         """Wait up to timeout for traffic, then run one tick()."""
+
+        if self._busy():
+            timeout = min(timeout, BUSY_POLL)
 
         try:
             for key, _ in self._selector.select(timeout):
@@ -2177,7 +2512,7 @@ class GospelChat:
     # Outboxes, tunnels and signaling.
     #
 
-    def _hold(self, peer, text, quote, ref):
+    def _hold(self, peer, text, quote, ref, blob=None, name=None):
         """Add a message to a peer outbox, unless we already hold that ref."""
 
         target = self.peer(peer)
@@ -2187,11 +2522,49 @@ class GospelChat:
             if held.ref == ref:
                 return held
 
-        held = _Held(ref, text, quote)
+        held = _Held(ref, text, quote, blob, name)
         target.outbox.append(held)
         target.active = _ms()
 
         return held
+
+    def _image_blob(self, image, name):
+        """What goes on the wire for an image, and the name it goes under."""
+
+        if isinstance(image, (bytes, bytearray, memoryview)):
+            data = bytes(image)
+        else:
+            data = self._image_read(image)
+
+            if name is None:
+                name = os.path.basename(os.fspath(image))
+
+        if len(data) > DATA_MAX:
+            raise GospelError("an image is at most %d bytes" % DATA_MAX)
+
+        kind = image_type(data)
+
+        if kind is None:
+            raise GospelError("not a PNG, JPEG, GIF or WebP image")
+
+        if name is None:
+            name = "image.%s" % kind
+
+        raw = _data_name(name)
+
+        return DATA_HEAD.pack(DATA_IMAGE, len(raw), raw) + data, name
+
+    @staticmethod
+    def _image_read(path):
+        try:
+            with open(path, "rb", opener=lambda p, flags: os.open(p,
+                flags | os.O_NONBLOCK)) as f:
+                if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+                    raise GospelError("%s is not a file" % path)
+
+                return f.read(DATA_MAX + 1)
+        except (OSError, TypeError) as e:
+            raise GospelError("cannot read the image: %s" % e)
 
     def _new_ref(self, ref):
         if ref is not None:
@@ -2223,6 +2596,17 @@ class GospelChat:
             return 1
 
         return 0
+
+    def _busy(self):
+        """Whether data is on its way to one of our peers right now."""
+
+        for target in self.peers.values():
+            for tunnel in (target.signal_tunnel, target.group_tunnel):
+                if tunnel is not None and tunnel.xfer is not None and \
+                    not tunnel.xfer.done:
+                    return True
+
+        return False
 
     def _signal(self):
         if self.signaling is None:
@@ -2328,6 +2712,7 @@ class GospelChat:
             quote=held.quote, author=self.spi)
         msg.id = held.msgid
         msg.delivered = held.delivered
+        msg.name = held.name
         msg.ts = time.time() - (_ms() - held.age) / 1000.0
         msg._chat = self
 

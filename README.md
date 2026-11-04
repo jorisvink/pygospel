@@ -1,6 +1,6 @@
 # vigil-python
 
-Text-only gospel chats in python, on top of [libkyrka](https://sanctorum.se).
+Gospel chats in python, on top of [libkyrka](https://sanctorum.se).
 
 This is the message part of [vigil](https://github.com/jorisvink/vigil)
 taken out of the app and made into a module you can build programs with. It
@@ -9,12 +9,13 @@ vigil-python.
 
 It speaks gospel over sanctum tunnels, it is compatible with
 [Vigil](https://github.com/jorisvink/vigil) and with
-the [gospel](https://github.com/jorisvink/gospel) project, and it does text
-only: no calls, no images, no files. It never announces that it can take
-data or avatars, so a Vigil peer that has one for you sends you a message
-saying so instead, which is what Vigil already does for a peer that cannot
-take data. The one bit it will set is the signed-name bit, and only when it
-has a name that verifies, see [Signed names](#signed-names).
+the [gospel](https://github.com/jorisvink/gospel) project. It does text both
+ways and sends images, see [Images](#images): no calls, no files, and it does
+not receive data. It never announces that it can take data or avatars, so a
+Vigil peer that has one for you sends you a message saying so instead, which
+is what Vigil already does for a peer that cannot take data. The one bit it
+will set is the signed-name bit, and only when it has a name that verifies,
+see [Signed names](#signed-names).
 
 ```python
 import pygospel
@@ -159,6 +160,20 @@ chat.on_group_delivered(ref, group, acked, pending)
 A group message goes to whoever is online at that moment and nowhere else.
 `on_group_delivered` counts down as they acknowledge it.
 
+# Images
+
+```python
+chat.send_image(0x02, "plot.png")
+chat.send_image(0x02, png_bytes, name="plot.png", ref=7)
+chat.send_group_image("plot.png")
+```
+
+An image is a path or bytes holding a PNG, JPEG, GIF or WebP of at most 4 MiB,
+anything else raises `GospelError`. It waits in the outbox like a message
+does and `on_sent`, `on_delivered` and `on_group_delivered` follow it, with
+the file name in `msg.name`. A peer that does not take data, such as gospel,
+gets a message saying it was sent an image instead.
+
 # Signed names
 
 A configuration made by Covenant carries a name for the device that the
@@ -299,6 +314,21 @@ folder `--dir` names, its answer is split to fit messages of 512 bytes, a
 message sent while it is working steers it, and `/abort`, `/status`,
 `/model` and `/new` are there to type into a chat. Devices in `--allow` are
 the only ones it answers.
+
+An agent sends an image by putting `[image: path]` on a line of its own in
+its answer. The path is relative to `--dir` and has to stay inside it.
+
+`--backend claude` runs Claude Code instead of `pi`. Anything its permission
+rules do not already allow comes to the chat as a question showing what it
+wants to run, and the device that sent the prompt answers with `yes`, `no` or
+`yes to all`. The turn waits until it does, and `/abort` stops it. Your Claude
+Code settings still apply, so what they allow runs without asking and what
+they deny stays denied.
+
+`yes to all` stops the asking for that device in that conversation, and every
+command it then allows goes to the log. It ends with `/ask`, `/new`, a restart
+or the agent being retired after `--idle` minutes without a message, and a
+session picked up again after that asks again.
 
 By default the agent signals the whole flock. With `--liturgy 0007` it shows
 up as a peer only for devices using that `liturgy_group`, and a chat starts
