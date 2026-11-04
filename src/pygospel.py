@@ -42,6 +42,7 @@ import sys
 import time
 import socket
 import struct
+import hashlib
 import selectors
 
 
@@ -125,6 +126,7 @@ REPLY_MAX  = MESSAGE_MAX - REPLY_HEAD.size
 
 # Flock domains. One-to-one chats and group chats live in different ones, so
 # the same two devices never share a key between a direct chat and a group.
+CALL_DOMAIN  = 0x0a
 FLOCK_DOMAIN = 0x0b
 GROUP_DOMAIN = 0x0c
 
@@ -207,6 +209,12 @@ def _fnv1a(data):
     return hash
 
 
+def _quote_hash(data):
+    """The first eight bytes of the SHA-256 of a media type, LF and text."""
+
+    return struct.unpack("!Q", hashlib.sha256(b"\n" + data).digest()[:8])[0]
+
+
 def _normalize(data):
     """Replace what Vigil replaces: control codes and broken UTF-8."""
 
@@ -261,8 +269,9 @@ def _normalize(data):
 def _mentions(text, names):
     """An @ of one of the given names, which is how Vigil spells a mention."""
 
-    for match in re.finditer(r"@([\w.\-]+)", text):
-        if match.group(1).lower() in names:
+    for name in names:
+        if re.search(r"(?<![A-Za-z0-9_\-])@%s(?![A-Za-z0-9_\-])"
+            % re.escape(name), text, re.IGNORECASE):
             return True
 
     return False
@@ -573,6 +582,8 @@ class GospelConfig:
             raise GospelError("no cathedral was configured")
         if self.mtu < 576 or self.mtu > 1500:
             raise GospelError("mtu %d is out of range" % self.mtu)
+        if not 0 <= self.group < 0xffff:
+            raise GospelError("liturgy_group must be below ffff")
 
 
 class Quote:
@@ -602,7 +613,7 @@ class Message:
         ref         a token of your choosing that identifies the message
                     back to you in on_sent and on_delivered
         id          the wire id, only meaningful on the tunnel it rode
-        hash        the FNV-1a hash of the text, what a reply points at
+        hash        the digest of the text, what a reply points at
         quote       the Quote this message answers, or None; its author is a
                 device id, ours if we wrote the message being answered
         author      who wrote it: our own spi, or the peer that sent it
@@ -621,7 +632,7 @@ class Message:
         self.group = group
         self.ref = ref
         self.id = 0
-        self.hash = _fnv1a(text.encode("utf-8")) if text else 0
+        self.hash = _quote_hash(text.encode("utf-8")) if text else 0
         self.quote = quote
         self.author = peer if author is None else author
         self.ts = time.time()
@@ -696,6 +707,7 @@ class Peer:
         self.present = False
         self.member = False
         self.typing = False
+        self.typing_out = False
         self.opened = False
         self.pushed = 0
         self.active = 0
@@ -835,12 +847,14 @@ class _Liturgy:
     A libkyrka context that only ever talks to a cathedral.
 
     The signaling liturgy tells us which peers are around and lets us say
-    which peers we want; a group liturgy tells us who is in a group.
+    which peers we want; a group liturgy tells us who is in a group; the
+    presence liturgy puts us in the list Vigil shows for a liturgy_group.
     """
 
-    def __init__(self, chat, group, remembrance):
+    def __init__(self, chat, group, remembrance, domain=GROUP_DOMAIN):
         self.chat = chat
         self.group = group
+        self.domain = domain
         self.remembrance = remembrance
         self.sock = chat._new_socket()
         self.ctx = chat._new_context(self, kek=False)
@@ -850,9 +864,6 @@ class _Liturgy:
         self.source = None
         self.alive = False
         self.last = 0
-        self.last_rx = 0
-        self.next_notify = 0
-        self.next_manage = 0
         self.updated = 0
         self.notify = 0
         self.want = None
@@ -863,18 +874,7 @@ class _Liturgy:
     def configure(self):
         self.ctx.cathedral_configure(**self.chat._cathedral_cfg(
             self, self.chat.spi, self.group,
-            self.chat.flock | GROUP_DOMAIN, self.remembrance, 0))
-
-    def manage(self):
-        now = _ms()
-
-        if now >= self.next_notify:
-            self.next_notify = now + NOTIFY_INTERVAL
-            self.chat._notify(self.ctx)
-
-        if now >= self.next_manage:
-            self.next_manage = now + MANAGE_INTERVAL
-            self.chat._manage(self.ctx)
+            self.chat.flock | self.domain, self.remembrance, 0))
 
     def signal(self, want):
         """
@@ -919,7 +919,6 @@ class _Liturgy:
             self.chat._emit("on_offline")
 
         self.chat._cathedral_pick(self.cathedral)
-        self.next_notify = 0
 
     def close(self):
         if self.closed:
@@ -1028,6 +1027,12 @@ class _Tunnel:
 
         held.msgid = self.next_msgid
         self.next_msgid += 1
+
+        # Replies wait until we know if our peer takes them, see _resend().
+        if held.quote is not None and held.quote.hash != 0 and not self.heard:
+            held.age = 0
+            return
+
         held.pending = True
         held.age = _ms()
         self.sendq.append(held)
@@ -1041,7 +1046,9 @@ class _Tunnel:
     def send_heartbeat(self):
         self.greeted = True
         self.typing_sent = self.chat.group_typing if self.is_group \
-            else self.peer.typing
+            else self.peer.typing_out
+        self.next_heartbeat = _ms() + (HOLEPUNCH_INTERVAL
+            if _ms() < self.holepunch else HEARTBEAT_INTERVAL)
 
         return self.send_frame(heartbeat_pack(self.local_uid,
             self.chat.nickname, self.typing_sent, self.chat.features,
@@ -1091,14 +1098,12 @@ class _Tunnel:
 
         self._resend(now)
 
-        typed = self.chat.group_typing if self.is_group else self.peer.typing
+        typed = self.chat.group_typing if self.is_group \
+            else self.peer.typing_out
 
         if not self.greeted or typed != self.typing_sent or \
             now >= self.next_heartbeat:
             self.send_heartbeat()
-
-        self.next_heartbeat = now + (HOLEPUNCH_INTERVAL
-            if now < self.holepunch else HEARTBEAT_INTERVAL)
 
         while self.sendq:
             held = self.sendq.pop(0)
@@ -1223,7 +1228,7 @@ class _Tunnel:
             group=self.group if self.is_group else None, quote=quote,
             author=self.peer.id)
         msg.id = msgid
-        msg.hash = _fnv1a(data)
+        msg.hash = _quote_hash(data)
         msg._chat = self.chat
 
         slot = self._seen_slot(msgid, _fnv1a(raw), msg)
@@ -1401,6 +1406,10 @@ class GospelChat:
         features    the feature bits to announce; by default none, plus the
                     signed-name bit if our own name verifies against the
                     flock key in the configuration
+        discoverable
+                    show up as a peer on Vigil devices using the same
+                    `liturgy_group` as our configuration. Vigil also shows
+                    those peers as callable, and we answer no call.
 
     Hooks, either overridden in a subclass or assigned as plain functions:
 
@@ -1419,7 +1428,8 @@ class GospelChat:
     """
 
     def __init__(self, config, nickname="", group=None, auto_ack=True,
-        p2p=None, cathedrals=None, signal_all=False, features=None):
+        p2p=None, cathedrals=None, signal_all=False, features=None,
+        discoverable=False):
         if isinstance(config, GospelConfig):
             cfg = config
         elif isinstance(config, (bytes, bytearray)) or "\n" in str(config):
@@ -1464,6 +1474,7 @@ class GospelChat:
         self.cathedrals = []
         self.signaling = None
         self.discovery = None
+        self.presence = None
         self.group = 0
         self.tallies = []
         self.rx = 0
@@ -1483,6 +1494,12 @@ class GospelChat:
 
         self.signaling = _Liturgy(self, SIGNAL_GROUP, True)
         self.signaling.configure()
+
+        # The discovery liturgy of calls is one up from liturgy_group.
+        if discoverable:
+            self.presence = _Liturgy(self, cfg.group + 1, False, CALL_DOMAIN)
+            self.presence.configure()
+            self.presence.poll_all()
 
         # liturgy_group in a Vigil configuration is what calls signal in,
         # chats start in no group.
@@ -1545,7 +1562,8 @@ class GospelChat:
         if self.group == 0:
             raise GospelError("we are not in a group")
 
-        text = self._check_text(text)
+        text = self._check_text(text,
+            MESSAGE_MAX if quote is None else REPLY_MAX)
 
         tally = _Tally(self._new_ref(ref), self.group)
 
@@ -1644,7 +1662,7 @@ class GospelChat:
             return
 
         self._check_peer(peer)
-        self.peer(peer).typing = bool(on)
+        self.peer(peer).typing_out = bool(on)
 
     def outbox(self, peer):
         """The messages we still hold for a peer, oldest first."""
@@ -1720,6 +1738,8 @@ class GospelChat:
             "group": "%04x" % self.group if self.group else None,
             "cathedral": self.cathedrals[0] if self.cathedrals else None,
             "liturgy": self.signaling is not None and self.signaling.alive,
+            "liturgy_group": "%04x" % self.config.group if self.presence
+                else None,
             "present": sum(1 for p in self.peers.values() if p.present),
             "members": sum(1 for p in self.peers.values() if p.member),
             "held": sum(len(p.outbox) for p in self.peers.values()),
@@ -1743,12 +1763,14 @@ class GospelChat:
 
         now = _ms()
 
-        for lit in (self.signaling, self.discovery):
+        for lit in (self.signaling, self.discovery, self.presence):
             if lit is None:
                 continue
 
             lit.check(now)
-            lit.manage()
+
+        if self.presence is not None:
+            self.presence.poll_all()
 
         for id in range(1, PEERS_PER_FLOCK):
             if id == self.spi:
@@ -1843,6 +1865,10 @@ class GospelChat:
         if self.signaling is not None:
             self.signaling.close()
             self.signaling = None
+
+        if self.presence is not None:
+            self.presence.close()
+            self.presence = None
 
         for owner in list(self._owners.values()):
             owner.close()
@@ -1976,7 +2002,6 @@ class GospelChat:
 
             self.rx += len(data)
             owner.source = from_addr
-            owner.last_rx = _ms()
 
             if isinstance(owner, _Tunnel):
                 if from_addr == owner.cathedral.addr:
@@ -2039,7 +2064,7 @@ class GospelChat:
 
             if lit is self.signaling:
                 self._present(peers)
-            else:
+            elif lit is self.discovery:
                 self._members(peers)
         elif event == libkyrka.KYRKA_EVENT_REMEMBRANCE_RECEIVED:
             self._more_cathedrals(info.get("cathedrals") or [])
@@ -2072,7 +2097,7 @@ class GospelChat:
         if ip == 0 or port == 0:
             return
 
-        addr = (self._ip(ip), port)
+        addr = self._addr(ip, port)
 
         hairpin = bool(info.get("flags", 0) &
             libkyrka.KYRKA_INFO_FLAG_SAME_EXTERNAL_IPV4)
@@ -2110,12 +2135,8 @@ class GospelChat:
             if id == self.spi:
                 continue
 
-            state = bool(peers[id])
-            target = self.peers.get(id)
-
-            if not state:
-                if target is not None:
-                    target.present = False
+            # The cathedral pushes each peer that signals us on its own.
+            if not peers[id]:
                 continue
 
             target = self.peer(id)
@@ -2265,7 +2286,7 @@ class GospelChat:
             if port == 0 or len(self.cathedrals) >= CATHEDRALS_MAX:
                 continue
 
-            addr = (self._ip(ip), port)
+            addr = self._addr(ip, port)
 
             if addr not in self.cathedrals:
                 self.cathedrals.append(addr)
@@ -2443,8 +2464,11 @@ class GospelChat:
             raise GospelError("no cathedral to talk to")
 
     @staticmethod
-    def _ip(value):
-        return socket.inet_ntoa(struct.pack("!I", value & 0xffffffff))
+    def _addr(ip, port):
+        """An address from libkyrka, which keeps it in network byte order."""
+
+        return (socket.inet_ntoa(struct.pack("=I", ip & 0xffffffff)),
+            socket.ntohs(port))
 
     #
     # libkyrka calls that are allowed to say no.

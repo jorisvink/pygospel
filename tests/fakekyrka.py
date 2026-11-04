@@ -505,6 +505,9 @@ class SocketModule:
     def inet_aton(self, text):
         return bytes(int(x) for x in text.split("."))
 
+    def ntohs(self, value):
+        return struct.unpack("!H", struct.pack("=H", value))[0]
+
     def _ip(self, host):
         try:
             socket = host.split(".")

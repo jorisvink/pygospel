@@ -112,8 +112,10 @@ chat = pygospel.GospelChat(pygospel.GospelConfig.load("gospel.conf"))
 ```
 
 Options that have no bearing on a text chat (routes, dns, a tunnel
-address) are read and ignored. `liturgy_group` is read but not used by
-chats: in a gospel configuration that is the group calls signal in.
+address) are read and ignored. `liturgy_group` is the group calls signal in,
+chats do not use it. It only matters here with `discoverable=True`, which
+puts this device in the list Vigil shows for that group. Vigil then also
+offers to call it, and nothing here answers a call.
 
 # One-to-one chats
 
@@ -253,6 +255,7 @@ Constructor options beyond `config` and `nickname`:
 | `p2p` | try direct paths, overriding the config |
 | `cathedrals` | `[(host, port), ...]` instead of the configured one |
 | `signal_all` | signal every device in the flock |
+| `discoverable` | show up as a peer for devices using the same `liturgy_group` |
 | `features` | bits to announce; none by default, plus the name bit when the signature verifies |
 
 With `auto_ack=False` nothing is acknowledged until you say you kept it,
@@ -275,6 +278,7 @@ A message you never ack is handed to you again after ten seconds.
 $ python3 examples/chatter.py -c gospel.conf -n alice
 $ python3 examples/echo.py -c gospel.conf
 $ python3 examples/presence.py -c gospel.conf
+$ python3 examples/agent.py -c gospel.conf -d ~/src
 ```
 
 Before `make install` they need the built module on the path instead:
@@ -287,6 +291,22 @@ $ PYTHONPATH=build/host/libkyrka/obj/python python3 examples/chatter.py -c gospe
 to point it at a device or a group. `echo.py` is the smallest thing that
 works, about twenty lines on top of `GospelChat`. `presence.py` watches the
 flock and says who is reachable and how.
+
+`agent.py` is a peer rather than a client: it hands whatever a device sends
+it to a `pi --mode rpc` child, one per conversation and one session each,
+and answers with what the agent comes back with. The agent works in the
+folder `--dir` names, its answer is split to fit messages of 512 bytes, a
+message sent while it is working steers it, and `/abort`, `/status`,
+`/model` and `/new` are there to type into a chat. Devices in `--allow` are
+the only ones it answers.
+
+By default the agent signals the whole flock. With `--liturgy 0007` it shows
+up as a peer only for devices using that `liturgy_group`, and a chat starts
+when one of them opens it. With `--group 0007`, or `/join 0007` in a
+one-to-one chat, it joins a group chat and answers what mentions it. Add
+`--no-signal-all` if it should only be seen in that group. A device outside
+the `liturgy_group` can still open a chat by id, the flock is what admits it
+and `--allow` is what gets it an answer.
 
 # How it reaches the network
 
@@ -363,7 +383,7 @@ Your neighborhood LLM
 | `tests/fakekyrka.py` | an in-process libkyrka and cathedral |
 | `tests/gospel_test.py` | the protocol and state machine, no network |
 | `tests/smoke.py` | the same against the real libkyrka |
-| `examples/` | a terminal client, an echo bot, a flock watcher |
+| `examples/` | a terminal client, an echo bot, a flock watcher, an agent peer |
 | `tools/cathedral/` | fetches sanctum, runs a cathedral, talks to it |
 | `tools/check-style.py` | tabs, alignment and column checks |
 | `tools/align.py` | applies what check-style.py asks for |

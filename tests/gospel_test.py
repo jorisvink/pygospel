@@ -544,6 +544,322 @@ def test_typing():
     two.close()
 
 
+def test_typing_each_way():
+    fresh()
+
+    one = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True)
+    two = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True)
+
+    pump([one, two], rounds=10)
+
+    sent = []
+    tunnel = two.peer(0x01).signal_tunnel
+    send_heartbeat = tunnel.send_heartbeat
+
+    def counted():
+        sent.append(tunnel.chat.peer(0x01).typing_out)
+        return send_heartbeat()
+
+    tunnel.send_heartbeat = counted
+
+    one.typing(True, 0x02)
+    pump([one, two], rounds=4)
+
+    ok("two saw one type", two.peer(0x01).typing)
+    ok("two says it is not typing", True not in sent)
+    ok("one hears nobody typing", not one.peer(0x02).typing)
+
+    one.typing(False, 0x02)
+    two.typing(True, 0x01)
+    pump([one, two], rounds=4)
+
+    ok("one saw two type", one.peer(0x02).typing)
+    ok("two hears nobody typing", not two.peer(0x01).typing)
+
+    one.typing(True, 0x02)
+    pump([one, two], rounds=2)
+    one.typing(False, 0x02)
+    pump([one, two], rounds=4)
+
+    ok("two still typing", one.peer(0x02).typing)
+
+    one.close()
+    two.close()
+
+
+def test_quote_hash_is_vigils():
+    check("hash of hello", pygospel.Message("hello").hash, 0xa1ad92f331dce2e0)
+
+
+def test_heartbeats_keep_going():
+    fresh()
+
+    one = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True)
+    two = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True)
+
+    pump([one, two], rounds=10)
+
+    sent = []
+    tunnel = one.peer(0x02).signal_tunnel
+    send_heartbeat = tunnel.send_heartbeat
+
+    def counted():
+        sent.append(pygospel._ms())
+        return send_heartbeat()
+
+    tunnel.send_heartbeat = counted
+
+    pump([one, two], rounds=120)
+
+    check("one every twelve seconds", len(sent), 10)
+    ok("still online", two.tunnel_online(0x01))
+
+    one.close()
+    two.close()
+
+
+def test_push_names_one_peer():
+    fresh()
+
+    chat = pygospel.GospelChat(config(0x01), p2p=False)
+    only = bytearray(pygospel.PEERS_PER_FLOCK)
+
+    only[0x02] = 1
+    chat._present(only)
+
+    only = bytearray(pygospel.PEERS_PER_FLOCK)
+
+    only[0x03] = 1
+    chat._present(only)
+
+    ok("02 is still around", chat.peer(0x02).present)
+    ok("03 is around", chat.peer(0x03).present)
+
+    pygospel.time.sleep(pygospel.PRESENT_EXPIRE / 1000.0)
+    chat.tick()
+
+    ok("02 expired", not chat.peer(0x02).present)
+
+    chat.close()
+
+
+def test_cathedral_is_not_the_peer():
+    fresh()
+
+    one = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True)
+    two = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True)
+
+    pump([one, two], rounds=10)
+
+    tunnel = one.peer(0x02).signal_tunnel
+    before = tunnel.last_rx
+
+    pygospel.time.sleep(1)
+    tunnel.sock.push(b"\x00" * 64, tunnel.cathedral.addr)
+    one._read(tunnel.sock, tunnel)
+
+    check("last_rx stays", tunnel.last_rx, before)
+
+    one.close()
+    two.close()
+
+
+def test_reply_waits_for_heartbeat():
+    fresh()
+
+    class Talker(pygospel.GospelChat):
+        def __init__(self, *args, **kwargs):
+            self.got = []
+            super().__init__(*args, **kwargs)
+
+        def on_message(self, msg):
+            self.got.append(msg)
+
+    one = Talker(config(0x01), nickname="alice", p2p=False, signal_all=True,
+        features=pygospel.FEATURE_REPLY)
+    two = Talker(config(0x02), nickname="bob", p2p=False, signal_all=True,
+        features=pygospel.FEATURE_REPLY)
+
+    pump([one, two], rounds=10)
+
+    tunnel = two.peer(0x01).signal_tunnel
+    tunnel.heard = False
+
+    two.reply(0x01, "the answer", pygospel.Quote(0x01, 0x1234))
+
+    check("not in line yet", tunnel.sendq, [])
+
+    pump([one, two], rounds=2)
+    check("nothing went out", one.got, [])
+
+    pump([one, two], rounds=20)
+
+    check("one arrived", len(one.got), 1)
+    check("with its quote", one.got[0].quote.hash, 0x1234)
+
+    one.close()
+    two.close()
+
+
+def test_discoverable():
+    fresh()
+
+    listed = {}
+
+    class Watcher(pygospel.GospelChat):
+        def _liturgy_event(self, lit, event, info):
+            if lit is self.presence and "peers" in info:
+                listed[self.spi] = [id for id, on in enumerate(info["peers"])
+                    if on]
+            super()._liturgy_event(lit, event, info)
+
+    a = Watcher(config(0x01, group="0007"), p2p=False, discoverable=True)
+    b = Watcher(config(0x02, group="0007"), p2p=False, discoverable=True)
+    c = Watcher(config(0x03, group="0009"), p2p=False, discoverable=True)
+    d = pygospel.GospelChat(config(0x04, group="0007"), p2p=False)
+
+    for chat in (a, b, c, d):
+        chat.signaling.ctx.wanted = bytes(pygospel.PEERS_PER_FLOCK)
+
+    pump([a, b, c, d], rounds=8)
+
+    check("the group calls discover in", a.presence.ctx.group, 0x0008)
+    check("the domain of calls", a.presence.ctx.flock_src,
+        int(FLOCK, 16) | 0x0a)
+    check("no extra liturgy by default", d.presence, None)
+    check("a sees b", listed[0x01], [0x02])
+    check("b sees a", listed[0x02], [0x01])
+    check("c sees neither", listed[0x03], [])
+    check("status says so", a.status()["liturgy_group"], "0007")
+    check("no group chat out of it", a.group, 0)
+    check("nor any member", a.members(), [])
+
+    check("no tunnel yet", a.peer(0x02).signal_tunnel, None)
+
+    b.open(0x01)
+    pump([a, b], rounds=8)
+
+    ok("opening it brings the tunnel up", a.tunnel_online(0x02))
+    ok("from both sides", b.tunnel_online(0x01))
+
+    b.send(0x01, "anyone home")
+    pump([a, b], rounds=4)
+
+    pump([a, b], rounds=pygospel.TUNNEL_IDLE // 1000 + 30)
+
+    ok("still up from a", a.tunnel_online(0x02))
+    ok("still up from b", b.tunnel_online(0x01))
+
+    for chat in (a, b, c, d):
+        chat.close()
+
+    boom("liturgy_group ffff is refused", lambda:
+        pygospel.GospelConfig.parse(config(0x01, group="ffff")))
+
+
+def test_group_bot():
+    fresh()
+
+    class Member(pygospel.GospelChat):
+        def __init__(self, *args, **kwargs):
+            self.got = []
+            super().__init__(*args, **kwargs)
+
+        def on_message(self, msg):
+            self.got.append(msg)
+
+    bot = Member(config(0x07), nickname="pi", p2p=False,
+        features=pygospel.FEATURE_REPLY)
+    vigil = Member(config(0x02), nickname="joris", p2p=False, group=0x0007,
+        features=pygospel.FEATURE_REPLY)
+
+    pump([bot, vigil], rounds=4)
+
+    check("not in it yet", bot.members(), [])
+
+    bot.join(0x0007)
+    pump([bot, vigil], rounds=10)
+
+    check("sees the member", [p.id for p in bot.members()], [0x02])
+    check("is seen", [p.id for p in vigil.members()], [0x07])
+    ok("no one-to-one tunnel for it", bot.peer(0x02).signal_tunnel is None)
+
+    vigil.send_group("what about you @pi.")
+    pump([bot, vigil], rounds=4)
+
+    question = bot.got[-1]
+
+    check("in the group", question.group, 0x0007)
+    ok("a dot ends a mention", question.mentions_me)
+
+    bot.reply_group("I am here", question)
+    pump([bot, vigil], rounds=4)
+
+    check("answered", vigil.got[-1].text, "I am here")
+    check("quote points at the question", vigil.got[-1].quote.hash,
+        pygospel.Message("what about you @pi.").hash)
+
+    pump([bot, vigil], rounds=90)
+
+    ok("still online", vigil.tunnel_online(0x07))
+    check("still a member", [p.id for p in vigil.members()], [0x07])
+
+    boom("group reply too long", lambda:
+        bot.reply_group("x" * pygospel.MESSAGE_MAX, question))
+    bot.send_group("x" * pygospel.MESSAGE_MAX)
+    pump([bot, vigil], rounds=2)
+
+    bot.leave()
+    pump([bot, vigil], rounds=20)
+
+    check("gone from the group", vigil.members(), [])
+
+    bot.close()
+    vigil.close()
+
+
+def test_mentions_end_like_vigil():
+    names = {"pi", "07"}
+
+    for text in ("@pi", "hey @PI, you", "@pi.", "(@pi)", "@07?"):
+        ok("mention in %r" % text, pygospel._mentions(text, names))
+
+    for text in ("pi", "a@pi", "@pie", "@pi-e", "@pi_e", "-@pi"):
+        ok("no mention in %r" % text, not pygospel._mentions(text, names))
+
+
+def test_addresses_in_network_order():
+    fresh()
+
+    chat = pygospel.GospelChat(config(0x01), p2p=True, signal_all=True)
+    tunnel = pygospel._Tunnel(chat, chat.peer(0x02), pygospel.SIGNAL_GROUP)
+
+    ip = struct.unpack("=I", bytes((198, 51, 100, 7)))[0]
+    port = struct.unpack("=H", struct.pack("!H", 5000))[0]
+
+    chat._peer_discovery(tunnel, {"ip": ip, "port": port, "flags": 0})
+    check("peer address", tunnel.addr, ("198.51.100.7", 5000))
+
+    chat._more_cathedrals([(ip, port)])
+    ok("cathedral address", ("198.51.100.7", 5000) in chat.cathedrals)
+
+    tunnel.addr = tunnel.cathedral.addr
+    tunnel.p2p_verify = 0
+
+    ip = struct.unpack("=I", bytes((127, 0, 0, 1)))[0]
+
+    chat._peer_discovery(tunnel, {"ip": ip, "port": port, "flags": 0})
+    ok("loopback stays on the relay", tunnel.relay)
+
+    chat.close()
+
+
 def test_peer_stops():
     net = fresh()
 
