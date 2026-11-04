@@ -34,7 +34,10 @@ import sys
 import json
 import time
 import uuid
+import shlex
+import shutil
 import argparse
+import tempfile
 import subprocess
 
 sys.path.insert(0, os.path.join(
@@ -53,6 +56,7 @@ ASK_YES      = ("y", "yes")
 ASK_NO       = ("n", "no")
 ASK_ALL      = ("yes to all", "yes all")
 ASK_MAX      = 1500
+VOICE_MAX    = 300
 IMAGE_LINE   = re.compile(r"^[ \t]*\[image:[ \t]*(.+?)[ \t]*\][ \t]*$", re.M)
 
 # The session a child must not inherit: those describe whoever started this
@@ -1120,6 +1124,108 @@ class ClaudeAgent(Agent):
 AGENTS = {"pi": PiAgent, "claude": ClaudeAgent}
 
 
+class Transcriber:
+    """
+    Turns voice messages into text one at a time, with a child on the loop
+    of the chat. The audio only exists in a private folder while its child
+    runs.
+    """
+
+    def __init__(self, chat, argv):
+        self.chat = chat
+        self.argv = argv
+        self.queue = []
+        self.msg = None
+        self.proc = None
+        self.fd = None
+        self.buf = b""
+        self.started = 0
+        self.dir = None
+
+    def add(self, msg):
+        self.queue.append(msg)
+        self.next()
+
+    def next(self):
+        if self.proc is not None or not self.queue:
+            return
+
+        self.msg = self.queue.pop(0)
+        self.buf = b""
+        self.started = time.monotonic()
+
+        if self.dir is None:
+            self.dir = tempfile.mkdtemp(prefix="vigil-voice-")
+
+        path = os.path.join(self.dir, "voice")
+
+        try:
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+                0o600), "wb") as f:
+                f.write(self.msg.data)
+
+            self.proc = subprocess.Popen(self.argv + [path],
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL)
+        except OSError as e:
+            self.finish(None, str(e))
+            return
+
+        self.msg.data = None
+        self.fd = self.proc.stdout.fileno()
+        os.set_blocking(self.fd, False)
+        self.chat.add_reader(self.fd, self.on_output)
+
+    def on_output(self, source):
+        try:
+            data = os.read(source, 65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+
+        if data:
+            self.buf += data
+            return
+
+        self.chat.remove_reader(self.fd)
+        self.proc.stdout.close()
+        code = self.proc.wait()
+        self.proc = None
+
+        if code != 0:
+            self.finish(None, "the transcriber exited with status %d" % code)
+            return
+
+        self.finish(self.buf.decode("utf-8", "replace").strip(), None)
+
+    def finish(self, text, error):
+        msg, self.msg = self.msg, None
+
+        self.wipe()
+        self.chat.heard(msg, text, error)
+        self.next()
+
+    def wipe(self):
+        if self.dir is not None:
+            shutil.rmtree(self.dir, ignore_errors=True)
+            self.dir = None
+
+    def check(self, now):
+        if self.proc is not None and now - self.started > VOICE_MAX:
+            self.proc.kill()
+
+    def close(self):
+        if self.proc is not None:
+            self.chat.remove_reader(self.fd)
+            self.proc.stdout.close()
+            self.proc.kill()
+            self.proc.wait()
+            self.proc = None
+
+        self.wipe()
+
+
 class AgentChat(pygospel.GospelChat):
     """A gospel chat whose replies come from agent sessions."""
 
@@ -1128,9 +1234,13 @@ class AgentChat(pygospel.GospelChat):
     def __init__(self, config, nickname, opts):
         self.opts = opts
         self.agents = {}
+        self.voices = None
+
+        if opts.transcribe:
+            self.voices = Transcriber(self, shlex.split(opts.transcribe))
 
         super().__init__(config, nickname=nickname, group=opts.group,
-            signal_all=opts.signal_all,
+            signal_all=opts.signal_all, take_data=True,
             discoverable=opts.liturgy is not None)
 
     def on_message(self, msg):
@@ -1157,6 +1267,68 @@ class AgentChat(pygospel.GospelChat):
             agent.command(msg, head, rest.strip())
         else:
             agent.feed(msg)
+
+    def on_data(self, msg):
+        """A voice message becomes a prompt, anything else a file to read."""
+
+        if not self.allowed(msg):
+            return
+
+        if not self.addressed(msg):
+            log("%s sent %s, and does not mention us" % (msg.where, msg.name))
+            return
+
+        if msg.media != "voice":
+            self.keep(msg)
+            return
+
+        if self.voices is None:
+            self.say(msg, "I cannot listen to voice messages, I was started "
+                "without --transcribe")
+            return
+
+        log("%s sent a voice message of %d bytes" % (msg.where,
+            len(msg.data)))
+        self.typing(True, msg.peer if msg.group is None else None)
+        self.voices.add(msg)
+
+    def heard(self, msg, text, error):
+        """What the transcriber made of a voice message."""
+
+        self.typing(False, msg.peer if msg.group is None else None)
+
+        if error is not None:
+            log("%s: no transcript: %s" % (msg.where, error))
+            self.say(msg, "I could not transcribe that: %s" % error)
+            return
+
+        if not text:
+            self.say(msg, "I could not make out any words in that")
+            return
+
+        msg.text = "(voice message, transcribed) %s" % text
+        self.on_message(msg)
+
+    def keep(self, msg):
+        """Save what a peer sent where the agent can go and read it."""
+
+        name = "%d-%s" % (time.time() * 1000, msg.name)
+        path = os.path.join(self.opts.inbox, name)
+
+        try:
+            os.makedirs(self.opts.inbox, mode=0o700, exist_ok=True)
+
+            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                0o600), "wb") as f:
+                f.write(msg.data)
+        except OSError as e:
+            log("%s: cannot keep %s: %s" % (msg.where, msg.name, e))
+            self.say(msg, "I could not keep %s" % msg.name)
+            return
+
+        msg.data = None
+        msg.text = "(sent you a %s, saved as %s)" % (msg.media, path)
+        self.on_message(msg)
 
     def chat_command(self, msg, head, rest):
         """
@@ -1282,6 +1454,9 @@ class AgentChat(pygospel.GospelChat):
 
         now = time.monotonic()
 
+        if self.voices is not None:
+            self.voices.check(now)
+
         for key in list(self.agents):
             agent = self.agents[key]
 
@@ -1310,6 +1485,9 @@ class AgentChat(pygospel.GospelChat):
             agent.close()
 
         self.agents.clear()
+
+        if self.voices is not None:
+            self.voices.close()
 
         super().close()
 
@@ -1346,15 +1524,19 @@ def main():
         help="minutes a session waits before its agent is retired")
     ap.add_argument("--max-out", type=int, default=4096,
         help="how much of one answer to send, in bytes")
+    ap.add_argument("--transcribe",
+        help="a command that prints the words of the audio file it is given "
+        "as its last argument, see tools/transcribe.py")
     ap.add_argument("--progress", action="store_true",
         help="say which tools the agent runs while it works")
 
     args = ap.parse_args()
     args.dir = os.path.abspath(args.dir)
     args.idle = max(30, args.idle * 60)
-    args.sessions = os.path.join(os.environ.get("XDG_STATE_HOME") or
-        os.path.expanduser("~/.local/state"), "vigil-python",
-        "claude-sessions.json")
+    state = os.path.join(os.environ.get("XDG_STATE_HOME") or
+        os.path.expanduser("~/.local/state"), "vigil-python")
+    args.sessions = os.path.join(state, "claude-sessions.json")
+    args.inbox = os.path.join(state, "inbox")
 
     if not os.path.isdir(args.dir):
         sys.exit("%s is not a folder" % args.dir)

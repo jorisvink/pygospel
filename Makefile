@@ -14,7 +14,7 @@ PYSITE?=$(shell $(PYTHON) -c \
 SRC=	src/pygospel.py
 TESTS=	tests/gospel_test.py tests/agent_test.py
 TOOLS=	examples/chatter.py examples/echo.py examples/presence.py \
-	examples/agent.py
+	examples/agent.py tools/transcribe.py
 
 all: python-mod
 

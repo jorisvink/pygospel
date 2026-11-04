@@ -11,6 +11,7 @@ import io
 import os
 import sys
 import json
+import select
 import tempfile
 import types
 
@@ -28,6 +29,19 @@ import agent  # noqa: E402
 import pygospel  # noqa: E402
 
 agent.log = lambda text: None
+
+CONFIG = """\
+vigil 1
+instance device07
+mode gospel
+spi 07
+kek %s
+cathedral 203.0.113.7:4469
+cathedral_id 5eb2411f
+cathedral_flock 493abf95a07e0c00
+cathedral_secret %s
+cathedral_cosk %s
+""" % ("11" * 32, "22" * 32, "33" * 64)
 
 failures = []
 checks = 0
@@ -121,7 +135,8 @@ class Quiet(agent.ClaudeAgent):
 
 def opts(tmp, **kwargs):
     fields = dict(claude="claude", dir="/work", model=None, idle=900,
-        max_out=4096, progress=False,
+        max_out=4096, progress=False, transcribe=None,
+        inbox=os.path.join(tmp, "inbox"),
         sessions=os.path.join(tmp, "state", "sessions.json"))
     fields.update(kwargs)
 
@@ -672,6 +687,196 @@ def test_brief_tells_about_images():
 
         ok("the syntax", "[image: path]" in one.brief())
         ok("no more of this", "no attachments" not in one.brief())
+
+
+def room(tmp, **kwargs):
+    fakekyrka.install(pygospel, fakekyrka.Network())
+
+    fields = dict(group=0, signal_all=True, liturgy=None, allow={0x02},
+        group_all=False, backend="claude")
+    fields.update(kwargs)
+
+    chat = agent.AgentChat(CONFIG, "bot", opts(tmp, **fields))
+    chat.said = []
+    chat.fed = []
+    chat.say = lambda msg, text: chat.said.append(text)
+    chat.on_message = lambda msg: chat.fed.append(msg.text)
+    chat.add_reader = lambda fd, callback: None
+    chat.remove_reader = lambda fd: None
+
+    return chat
+
+
+def blob(media, name="note", data=b"audio", author=0x02, group=None):
+    msg = message("", author=author, group=group)
+    msg.media = media
+    msg.name = name
+    msg.data = data
+    msg.mentions_me = False
+
+    return msg
+
+
+def wait_voice(chat):
+    for _ in range(500):
+        if chat.voices.proc is None and not chat.voices.queue:
+            return
+
+        fd = chat.voices.fd
+
+        if select.select([fd], [], [], 0.05)[0]:
+            chat.voices.on_output(fd)
+
+
+def script(tmp, body):
+    path = os.path.join(tmp, "script.sh")
+
+    with open(path, "w") as f:
+        f.write("#!/bin/sh\n" + body + "\n")
+
+    os.chmod(path, 0o700)
+
+    return path
+
+
+def test_voice_becomes_a_prompt():
+    with tempfile.TemporaryDirectory() as tmp:
+        seen = os.path.join(tmp, "seen")
+        chat = room(tmp, transcribe=script(tmp,
+            'cat "$1" > %s; ls -ld "$1" > %s.mode; echo "  draw a cat "'
+            % (seen, seen)))
+
+        chat.on_data(blob("voice", data=b"the audio"))
+        wait_voice(chat)
+
+        check("the prompt", chat.fed,
+            ["(voice message, transcribed) draw a cat"])
+
+        with open(seen, "rb") as f:
+            check("it got the audio", f.read(), b"the audio")
+
+        with open(seen + ".mode") as f:
+            ok("only ours", f.read().startswith("-rw-------"))
+
+        check("the audio is gone", chat.voices.dir, None)
+        chat.close()
+
+
+def test_voice_cannot_run_commands_or_answer():
+    with tempfile.TemporaryDirectory() as tmp:
+        for words in ("/new", "yes to all"):
+            chat = room(tmp, transcribe=script(tmp, "echo '%s'" % words))
+
+            chat.on_data(blob("voice"))
+            wait_voice(chat)
+
+            ok("not bare: " + words,
+                chat.fed[0] != words and chat.fed[0].endswith(words))
+            ok("no slash first", not chat.fed[0].startswith("/"))
+            chat.close()
+
+
+def test_voice_failures_are_told():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = room(tmp)
+        chat.on_data(blob("voice"))
+        ok("no transcriber", "--transcribe" in chat.said[0])
+        chat.close()
+
+        chat = room(tmp, transcribe=script(tmp, "exit 3"))
+        chat.on_data(blob("voice"))
+        wait_voice(chat)
+        ok("a bad exit", "status 3" in chat.said[0])
+        check("no prompt", chat.fed, [])
+        chat.close()
+
+        chat = room(tmp, transcribe=script(tmp, "echo"))
+        chat.on_data(blob("voice"))
+        wait_voice(chat)
+        ok("no words", "words" in chat.said[0])
+        check("no prompt", chat.fed, [])
+        chat.close()
+
+        chat = room(tmp, transcribe=os.path.join(tmp, "nothing"))
+        chat.on_data(blob("voice"))
+        ok("no such command", "could not transcribe" in chat.said[0])
+        chat.close()
+
+
+def test_voice_stuck_is_killed():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = room(tmp, transcribe=script(tmp, "exec sleep 60"))
+
+        chat.on_data(blob("voice"))
+        chat.voices.started -= agent.VOICE_MAX + 1
+        chat.voices.check(agent.time.monotonic())
+        wait_voice(chat)
+
+        ok("said so", "could not transcribe" in chat.said[0])
+        chat.close()
+
+
+def test_voice_one_at_a_time():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = room(tmp, transcribe=script(tmp, 'cat "$1"'))
+
+        chat.on_data(blob("voice", data=b"one"))
+        chat.on_data(blob("voice", data=b"two"))
+        wait_voice(chat)
+
+        check("in order", [text.split()[-1] for text in chat.fed],
+            ["one", "two"])
+        chat.close()
+
+
+def test_data_only_from_who_is_allowed():
+    with tempfile.TemporaryDirectory() as tmp:
+        seen = os.path.join(tmp, "seen")
+        chat = room(tmp, transcribe=script(tmp, "touch %s" % seen))
+
+        chat.on_data(blob("voice", author=0x09))
+        chat.on_data(blob("image", name="a.png", author=0x09))
+        wait_voice(chat)
+
+        check("nothing fed", chat.fed, [])
+        check("nothing said", chat.said, [])
+        ok("not transcribed", not os.path.exists(seen))
+        ok("not kept", not os.path.exists(chat.opts.inbox))
+        chat.close()
+
+
+def test_data_in_a_group_needs_group_all():
+    with tempfile.TemporaryDirectory() as tmp:
+        seen = os.path.join(tmp, "seen")
+        chat = room(tmp, transcribe=script(tmp, "touch %s" % seen))
+
+        chat.on_data(blob("voice", group=0x0007))
+        wait_voice(chat)
+
+        ok("not transcribed", not os.path.exists(seen))
+        check("nothing fed", chat.fed, [])
+        chat.close()
+
+
+def test_files_are_kept():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = room(tmp)
+
+        chat.on_data(blob("image", name="a b.png", data=b"png"))
+
+        ok("told about it", "image" in chat.fed[0])
+
+        path = chat.fed[0].split("saved as ", 1)[1].rstrip(")")
+
+        ok("under the inbox", path.startswith(chat.opts.inbox + os.sep))
+        check("mode", os.stat(path).st_mode & 0o777, 0o600)
+        check("mode of the folder", os.stat(chat.opts.inbox).st_mode & 0o777,
+            0o700)
+
+        with open(path, "rb") as f:
+            check("contents", f.read(), b"png")
+
+        chat.close()
 
 
 def main():

@@ -3,9 +3,9 @@ Gospel chats, driven by the libkyrka python module.
 
 Gospel is the protocol Vigil uses for calls and messages over sanctum
 tunnels. This module speaks the chat part of it: it sends and receives text
-messages and sends images, in one-to-one chats and in group chats. It is
-compatible with Vigil and with confession. It cannot receive data and it
-claims no other ability.
+messages, sends images and with take_data receives images, files and voice
+messages, in one-to-one chats and in group chats. It is compatible with Vigil
+and with confession, and it claims no other ability.
 
 The fastest way in:
 
@@ -105,9 +105,9 @@ TYPE_HEARTBEAT = 3
 TYPE_DATA_ACK  = 4
 TYPE_REPLY     = 5
 
-# The features we tell our peers about. We take no data and no avatars, so
-# those bits stay off; the name bit follows whether we have a name that
-# verifies, see GospelChat._own_name.
+# The features we tell our peers about. The data bit is on with take_data and
+# the name bit follows whether we have a name that verifies, see
+# GospelChat._own_name.
 FEATURE_DATA   = 0x01
 FEATURE_REPLY  = 0x02
 FEATURE_NAME   = 0x04
@@ -129,12 +129,23 @@ REPLY_MAX  = MESSAGE_MAX - REPLY_HEAD.size
 # Data goes out as chunks, told apart from a frame by their size. The blob
 # they carve up starts with a head that says what it is and what it is called.
 DATA_IMAGE    = 1
+DATA_FILE     = 2
+DATA_VOICE    = 3
+DATA_AVATAR   = 4
+DATA_KINDS    = {DATA_IMAGE: "image", DATA_FILE: "file", DATA_VOICE: "voice"}
 DATA_NAME_MAX = 126
 DATA_MAX      = 4096 * 1024
 DATA_HEAD     = struct.Struct("!BB%ds" % DATA_NAME_MAX)
 DATA_ACK_HEAD = struct.Struct("!II")
+DATA_ACK_BITS = MESSAGE_MAX - DATA_ACK_HEAD.size
+AVATAR_MAX    = 32 * 1024
+WIRE_MAX      = DATA_MAX + DATA_HEAD.size
 CHUNK_DATA    = 1152
 CHUNK_HEAD    = struct.Struct("!QIII")
+CHUNK_SIZE    = CHUNK_HEAD.size + CHUNK_DATA
+CHUNKS_MAX    = (WIRE_MAX + CHUNK_DATA - 1) // CHUNK_DATA
+RXFERS_MAX    = 4
+ACK_CHUNKS    = 16
 
 # What a peer that takes no data gets instead, the same words Vigil uses.
 DATA_NOTICE = ("I sent you an image, but you are on gospel so you cannot open "
@@ -202,6 +213,8 @@ HOLEPUNCH_INTERVAL     = 1 * 1000
 STORE_WAIT             = 10 * 1000
 DATA_PROBE             = 2 * 1000
 DATA_STALL             = 20 * 1000
+DATA_WAIT              = 60 * 1000
+ACK_DELAY              = 20
 RTT_START              = 300
 
 # Chunks per second, and how many we send in one go.
@@ -309,23 +322,33 @@ def image_type(data):
     return None
 
 
+def _data_name_valid(raw):
+    """Whether these bytes are a plain file name Vigil will accept."""
+
+    if not raw or len(raw) > DATA_NAME_MAX:
+        return False
+
+    if raw[:1] == b".":
+        return False
+
+    for byte in raw:
+        if byte < 0x20 or byte == 0x7f or byte in b"/\\":
+            return False
+
+    return True
+
+
 def _data_name(name):
-    """The name as bytes, if it is a plain file name Vigil will accept."""
+    """The name as bytes, or an error if Vigil would not accept it."""
 
     if not isinstance(name, str):
         raise GospelError("an image name is a str")
 
     raw = _normalize(name.encode("utf-8"))
 
-    if not raw or len(raw) > DATA_NAME_MAX:
-        raise GospelError("an image name is 1 to %d bytes" % DATA_NAME_MAX)
-
-    if raw[:1] == b".":
-        raise GospelError("an image name does not start with a dot")
-
-    for byte in raw:
-        if byte < 0x20 or byte == 0x7f or byte in b"/\\":
-            raise GospelError("%r is not a plain file name" % name)
+    if not _data_name_valid(raw):
+        raise GospelError("%r is not a plain file name of 1 to %d bytes"
+            % (name, DATA_NAME_MAX))
 
     return raw
 
@@ -678,7 +701,9 @@ class Message:
                     back to you in on_sent and on_delivered
         id          the wire id, only meaningful on the tunnel it rode
         hash        the digest of the text, what a reply points at
-        name        the file name if this is an image we send, else None
+        name        the file name if this carries data, else None
+        media       what the data is: image, file or voice, else None
+        data        the bytes that arrived, handed to on_data
         quote       the Quote this message answers, or None; its author is a
                 device id, ours if we wrote the message being answered
         author      who wrote it: our own spi, or the peer that sent it
@@ -688,7 +713,8 @@ class Message:
     """
 
     __slots__ = ("text", "peer", "group", "ref", "id", "hash", "quote",
-        "author", "ts", "delivered", "name", "_chat", "_ack")
+        "author", "ts", "delivered", "name", "media", "data", "_chat",
+        "_ack")
 
     def __init__(self, text="", peer=0, group=None, ref=0, quote=None,
         author=None):
@@ -703,6 +729,8 @@ class Message:
         self.ts = time.time()
         self.delivered = False
         self.name = None
+        self.media = None
+        self.data = None
         self._chat = None
         self._ack = None
 
@@ -851,11 +879,12 @@ class _Seen:
     it to say it kept the message.
     """
 
-    __slots__ = ("msgid", "hash", "token", "age", "msg")
+    __slots__ = ("msgid", "hash", "size", "token", "age", "msg")
 
     def __init__(self):
         self.msgid = 0
         self.hash = 0
+        self.size = 0
         self.token = 0
         self.age = 0
         self.msg = None
@@ -953,6 +982,26 @@ class _Xfer:
             self.rate = min(self.rate + self.rate // 8 + 8, RATE_MAX)
         elif rtt > self.rtt_min * 2 + 20:
             self.rate = max(self.rate - self.rate // 8, RATE_MIN)
+
+
+class _Rxfer:
+    """A blob a peer is sending us, as far as it got."""
+
+    __slots__ = ("msgid", "size", "count", "data", "have", "got", "base",
+        "latest", "last", "ack_due", "unacked")
+
+    def __init__(self, msgid, size, count, now):
+        self.msgid = msgid
+        self.size = size
+        self.count = count
+        self.data = bytearray(size)
+        self.have = bytearray(count)
+        self.got = 0
+        self.base = 0
+        self.latest = 0
+        self.last = now
+        self.ack_due = 0
+        self.unacked = 0
 
 
 class _Tally:
@@ -1107,6 +1156,7 @@ class _Tunnel:
         self.sendq = []
         self.waitq = []
         self.xfer = None
+        self.rxfer = None
         self.seen = [_Seen() for _ in range(SEEN_MAX)]
         self.seen_next = 0
 
@@ -1245,6 +1295,7 @@ class _Tunnel:
 
         self._resend(now)
         self._xfer_run(now)
+        self._rxfer_check(now)
 
         typed = self.chat.group_typing if self.is_group \
             else self.peer.typing_out
@@ -1396,6 +1447,11 @@ class _Tunnel:
     def on_frame(self, buf):
         self.last_rx = _ms()
 
+        if len(buf) == CHUNK_SIZE:
+            if self.chat.features & FEATURE_DATA:
+                self._on_chunk(buf)
+            return
+
         if len(buf) != FRAME_SIZE:
             return
 
@@ -1414,6 +1470,152 @@ class _Tunnel:
             self._on_heartbeat(payload)
         elif ftype == TYPE_DATA_ACK:
             self._on_data_ack(msgid, length, payload)
+
+    def _on_chunk(self, buf):
+        """A chunk of a blob, which goes together with the ones before it."""
+
+        msgid, index, count, size = CHUNK_HEAD.unpack_from(buf, 0)
+
+        if msgid == 0 or count == 0 or count > CHUNKS_MAX:
+            return
+
+        if size <= DATA_HEAD.size or size > WIRE_MAX:
+            return
+
+        if size > count * CHUNK_DATA or size <= (count - 1) * CHUNK_DATA:
+            return
+
+        if index >= count:
+            return
+
+        slot = self._seen_data(msgid, size)
+
+        if slot is not None:
+            if slot.token == 0:
+                self.send_ack(msgid)
+                self._data_ack(msgid, None, count)
+                return
+
+            if _ms() - slot.age < DATA_WAIT:
+                self._data_ack(msgid, None, count)
+                return
+
+            slot.msgid = 0
+
+        xfer = self.rxfer
+
+        if xfer is not None and (xfer.msgid != msgid or xfer.count != count or
+            xfer.size != size):
+            self._rxfer_free()
+            xfer = None
+
+        if xfer is None:
+            if self.chat.rxfers >= RXFERS_MAX:
+                return
+
+            xfer = _Rxfer(msgid, size, count, _ms())
+            self.rxfer = xfer
+            self.chat.rxfers += 1
+
+        if not xfer.have[index]:
+            off = index * CHUNK_DATA
+            length = min(CHUNK_DATA, size - off)
+            xfer.data[off:off + length] = buf[CHUNK_HEAD.size:
+                CHUNK_HEAD.size + length]
+            xfer.have[index] = 1
+            xfer.got += 1
+
+        xfer.unacked += 1
+        xfer.latest = index
+        xfer.last = _ms()
+
+        if xfer.ack_due == 0:
+            xfer.ack_due = xfer.last + ACK_DELAY
+
+        while xfer.base < count and xfer.have[xfer.base]:
+            xfer.base += 1
+
+        if xfer.got < count:
+            if xfer.unacked >= ACK_CHUNKS:
+                self._data_ack(msgid, xfer, count)
+            return
+
+        self._data_arrived(xfer)
+        self._data_ack(msgid, None, count)
+        self._rxfer_free()
+
+    def _data_arrived(self, xfer):
+        """All of it is here, hand it over or drop what we cannot use."""
+
+        kind, length, raw = DATA_HEAD.unpack_from(xfer.data, 0)
+        name = _normalize(raw[:length])
+        slot = self._seen_slot(xfer.msgid, 0, None)
+        slot.size = xfer.size
+
+        if kind not in DATA_KINDS or length > DATA_NAME_MAX or \
+            not _data_name_valid(name):
+            self.send_ack(xfer.msgid)
+            return
+
+        msg = Message("", peer=self.peer.id,
+            group=self.group if self.is_group else None, author=self.peer.id)
+        msg.id = xfer.msgid
+        msg.name = name.decode("utf-8", "replace")
+        msg.media = DATA_KINDS[kind]
+        msg.data = bytes(xfer.data[DATA_HEAD.size:])
+        msg._chat = self.chat
+
+        slot.token = self.chat._next_token()
+
+        if self.chat.auto_ack:
+            slot.token = 0
+            self.send_ack(xfer.msgid)
+        else:
+            msg._ack = (self, slot)
+
+        self.peer.active = _ms()
+        self.chat._emit("on_data", msg)
+
+    def _data_ack(self, msgid, xfer, count):
+        """Tell our peer which chunks we have, all of them without an xfer."""
+
+        bits = bytearray(DATA_ACK_BITS)
+
+        if xfer is None:
+            head = DATA_ACK_HEAD.pack(count, count - 1)
+        else:
+            head = DATA_ACK_HEAD.pack(xfer.base, xfer.latest)
+
+            for idx in range(min(DATA_ACK_BITS * 8, count - xfer.base - 1)):
+                if xfer.have[xfer.base + 1 + idx]:
+                    bits[idx // 8] |= 1 << (idx % 8)
+
+            xfer.ack_due = 0
+            xfer.unacked = 0
+
+        self.send_frame(frame_pack(msgid, TYPE_DATA_ACK, head + bytes(bits)))
+
+    def _rxfer_check(self, now):
+        """Ack what is due, drop the data if our peer stopped sending it."""
+
+        xfer = self.rxfer
+
+        if xfer is None:
+            return
+
+        if now - xfer.last > DATA_STALL:
+            self._rxfer_free()
+            return
+
+        if xfer.ack_due != 0 and now >= xfer.ack_due:
+            self._data_ack(xfer.msgid, xfer, xfer.count)
+
+    def _rxfer_free(self):
+        if self.rxfer is None:
+            return
+
+        self.rxfer = None
+        self.chat.rxfers -= 1
 
     def _on_heartbeat(self, payload):
         uid, nick, typing, features, instance, signature = \
@@ -1547,11 +1749,19 @@ class _Tunnel:
 
         return None
 
+    def _seen_data(self, msgid, size):
+        for slot in self.seen:
+            if slot.msgid != 0 and slot.msgid == msgid and slot.size == size:
+                return slot
+
+        return None
+
     def _seen_slot(self, msgid, hash, msg):
         slot = self.seen[self.seen_next % SEEN_MAX]
         self.seen_next += 1
         slot.msgid = msgid
         slot.hash = hash
+        slot.size = 0
         slot.token = 0
         slot.msg = msg
         slot.age = _ms()
@@ -1628,6 +1838,7 @@ class _Tunnel:
 
         self.closed = True
         self.xfer = None
+        self._rxfer_free()
 
         for held in self.sendq:
             held.pending = False
@@ -1650,7 +1861,7 @@ class _Tunnel:
 
 class GospelChat:
     """
-    A gospel chat: text both ways, images out.
+    A gospel chat: text both ways, images out, and data in with take_data.
 
     Arguments:
         config      a GospelConfig, the path to a Vigil configuration file,
@@ -1669,6 +1880,8 @@ class GospelChat:
         features    the feature bits to announce; by default none, plus the
                     signed-name bit if our own name verifies against the
                     flock key in the configuration
+        take_data   receive images, files and voice messages through on_data
+                    and tell our peers we do. Avatars are acked and dropped.
         discoverable
                     show up as a peer on Vigil devices using the same
                     `liturgy_group` as our configuration. Vigil also shows
@@ -1677,6 +1890,7 @@ class GospelChat:
     Hooks, either overridden in a subclass or assigned as plain functions:
 
         on_message(msg)                 a message arrived
+        on_data(msg)                    an image, file or voice message arrived
         on_sent(ref, msg)               one of our messages left for a peer
         on_delivered(ref, msg)          a peer stored one of our messages
         on_group_delivered(ref, group, acked, pending)
@@ -1692,7 +1906,7 @@ class GospelChat:
 
     def __init__(self, config, nickname="", group=None, auto_ack=True,
         p2p=None, cathedrals=None, signal_all=False, features=None,
-        discoverable=False):
+        discoverable=False, take_data=False):
         if isinstance(config, GospelConfig):
             cfg = config
         elif isinstance(config, (bytes, bytearray)) or "\n" in str(config):
@@ -1728,7 +1942,11 @@ class GospelChat:
         if features is None:
             features = FEATURE_NAME if self.named else FEATURES
 
+        if take_data:
+            features |= FEATURE_DATA
+
         self.features = features
+        self.rxfers = 0
 
         self.nickname = self._check_nick(nickname)
         self.group_typing = False
@@ -2222,6 +2440,9 @@ class GospelChat:
     def on_message(self, msg):
         pass
 
+    def on_data(self, msg):
+        pass
+
     def on_sent(self, ref, msg):
         pass
 
@@ -2598,12 +2819,17 @@ class GospelChat:
         return 0
 
     def _busy(self):
-        """Whether data is on its way to one of our peers right now."""
+        """Whether data is on its way to or from one of our peers."""
 
         for target in self.peers.values():
             for tunnel in (target.signal_tunnel, target.group_tunnel):
-                if tunnel is not None and tunnel.xfer is not None and \
-                    not tunnel.xfer.done:
+                if tunnel is None:
+                    continue
+
+                if tunnel.rxfer is not None:
+                    return True
+
+                if tunnel.xfer is not None and not tunnel.xfer.done:
                     return True
 
         return False

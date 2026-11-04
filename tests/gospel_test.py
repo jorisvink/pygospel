@@ -1937,6 +1937,342 @@ def test_group_image():
     c.close()
 
 
+def data_pair(**kwargs):
+    fresh()
+
+    a = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True, features=pygospel.FEATURE_DATA)
+    b = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True, take_data=True, **kwargs)
+    got = []
+
+    b.on_data = got.append
+    pump([a, b], rounds=8)
+
+    return a, b, got
+
+
+def blob(kind, name, data):
+    raw = name if isinstance(name, bytes) else name.encode()
+
+    return pygospel.DATA_HEAD.pack(kind, len(raw), raw) + data
+
+
+def chunks(msgid, whole):
+    count = (len(whole) + 1151) // 1152
+    out = []
+
+    for idx in range(count):
+        out.append(pygospel.CHUNK_HEAD.pack(msgid, idx, count, len(whole)) +
+            whole[idx * 1152:(idx + 1) * 1152].ljust(1152, b"\x00"))
+
+    return out
+
+
+def test_data_bit():
+    a, b, got = data_pair()
+
+    ok("announced", b.features & pygospel.FEATURE_DATA)
+    ok("heard", a.peer(0x02).signal_tunnel.features & pygospel.FEATURE_DATA)
+
+    a.close()
+    b.close()
+
+
+def test_data_comes_in():
+    a, b, got = data_pair()
+    delivered = []
+
+    a.on_delivered = lambda ref, msg: delivered.append(ref)
+    a.send_image(0x02, PNG, name="plot.png", ref=4)
+    pump([a, b], rounds=20, ms=50)
+
+    check("one arrived", len(got), 1)
+    check("bytes", got[0].data, PNG)
+    check("name", got[0].name, "plot.png")
+    check("media", got[0].media, "image")
+    check("peer", got[0].peer, 0x01)
+    check("author", got[0].author, 0x01)
+    check("group", got[0].group, None)
+    check("the sender knows", delivered, [4])
+    check("no transfer left", b.peer(0x01).signal_tunnel.rxfer, None)
+    check("none counted", b.rxfers, 0)
+    ok("not busy", not b._busy())
+
+    a.close()
+    b.close()
+
+
+def test_data_no_bit_no_data():
+    fresh()
+
+    a = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True)
+    b = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True)
+    got = []
+
+    b.on_data = got.append
+    pump([a, b], rounds=8)
+
+    tunnel = b.peer(0x01).signal_tunnel
+
+    for one in chunks(9, blob(1, "a.png", PNG)):
+        tunnel.on_frame(one)
+
+    check("dropped", got, [])
+    check("no transfer", tunnel.rxfer, None)
+
+    a.close()
+    b.close()
+
+
+def test_data_kinds():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+
+    for msgid, kind in ((50, pygospel.DATA_FILE), (51, pygospel.DATA_VOICE)):
+        for one in chunks(msgid, blob(kind, "x", b"data")):
+            tunnel.on_frame(one)
+
+    check("media", [m.media for m in got], ["file", "voice"])
+
+    a.close()
+    b.close()
+
+
+def test_data_dropped_but_acked():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+    frames = []
+
+    tunnel.send_frame = lambda frame: frames.append(frame)
+
+    for msgid, whole in ((60, blob(pygospel.DATA_AVATAR, "avatar", b"pic")),
+        (61, blob(77, "x", b"data")), (62, blob(1, "../evil", b"data")),
+        (63, blob(1, ".hidden", b"data")), (64, blob(1, "a\\b", b"data")),
+        (65, blob(1, "", b"data")),
+        (66, pygospel.struct.pack("!BB", 1, 200) + b"x" * 200)):
+        frames.clear()
+
+        for one in chunks(msgid, whole):
+            tunnel.on_frame(one)
+
+        types = [pygospel.frame_unpack(f)[2] for f in frames]
+
+        ok("acked %d" % msgid, pygospel.TYPE_ACK in types)
+
+    check("none handed over", got, [])
+
+    a.close()
+    b.close()
+
+
+def test_data_bad_chunks():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+    head = pygospel.CHUNK_HEAD
+    pad = b"\x00" * 1152
+    big = pygospel.WIRE_MAX + 1
+
+    for what, fields in (("no id", (0, 0, 1, 200)),
+        ("no count", (1, 0, 0, 200)),
+        ("too many", (1, 0, pygospel.CHUNKS_MAX + 1, 200)),
+        ("too small", (1, 0, 1, 128)),
+        ("too large", (1, 0, 3642, big)),
+        ("size past count", (1, 0, 1, 1153)),
+        ("size short of count", (1, 0, 2, 1152)),
+        ("index past count", (1, 1, 1, 200))):
+        tunnel.on_frame(head.pack(*fields) + pad)
+        check(what, tunnel.rxfer, None)
+
+    a.close()
+    b.close()
+
+
+def test_data_new_id_replaces_old():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+    old = chunks(70, blob(1, "a", PNG))
+    new = chunks(71, blob(1, "b", b"x"))
+
+    tunnel.on_frame(old[0])
+    check("one going", b.rxfers, 1)
+    tunnel.on_frame(new[0])
+
+    check("the new one", [m.name for m in got], ["b"])
+    check("old one gone", b.rxfers, 0)
+
+    a.close()
+    b.close()
+
+
+def test_data_out_of_order_and_dupes():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+    parts = chunks(72, blob(1, "a", PNG))
+
+    for one in reversed(parts):
+        tunnel.on_frame(one)
+        tunnel.on_frame(one)
+
+    check("once", len(got), 1)
+    check("whole", got[0].data, PNG)
+
+    for one in parts:
+        tunnel.on_frame(one)
+
+    check("not again", len(got), 1)
+
+    a.close()
+    b.close()
+
+
+def test_data_stalls():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+
+    tunnel.on_frame(chunks(73, blob(1, "a", PNG))[0])
+    ok("busy", b._busy())
+    pump([b], rounds=3, ms=pygospel.DATA_STALL)
+
+    check("given up", b.rxfers, 0)
+    ok("not busy", not b._busy())
+
+    a.close()
+    b.close()
+
+
+def test_data_limit_on_transfers():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+
+    b.rxfers = pygospel.RXFERS_MAX
+    tunnel.on_frame(chunks(74, blob(1, "a", PNG))[0])
+    check("not taken", tunnel.rxfer, None)
+    b.rxfers = 0
+
+    a.close()
+    b.close()
+
+
+def test_data_closed_tunnel_counts_down():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+
+    tunnel.on_frame(chunks(75, blob(1, "a", PNG))[0])
+    check("one going", b.rxfers, 1)
+    tunnel.close()
+    check("none going", b.rxfers, 0)
+
+    a.close()
+    b.close()
+
+
+def test_data_no_auto_ack():
+    a, b, got = data_pair(auto_ack=False)
+    tunnel = b.peer(0x01).signal_tunnel
+    parts = chunks(76, blob(1, "a", PNG))
+    frames = []
+
+    tunnel.send_frame = lambda frame: frames.append(frame)
+
+    for one in parts:
+        tunnel.on_frame(one)
+
+    types = [pygospel.frame_unpack(f)[2] for f in frames]
+
+    check("handed over", len(got), 1)
+    ok("no ack yet", pygospel.TYPE_ACK not in types)
+
+    frames.clear()
+    tunnel.on_frame(parts[0])
+
+    types = [pygospel.frame_unpack(f)[2] for f in frames]
+
+    check("not handed over again", len(got), 1)
+    check("only says it has it", types, [pygospel.TYPE_DATA_ACK])
+
+    frames.clear()
+    got[0].ack()
+
+    check("now it does", [pygospel.frame_unpack(f)[2] for f in frames],
+        [pygospel.TYPE_ACK])
+
+    a.close()
+    b.close()
+
+
+def test_data_never_acked_comes_again():
+    a, b, got = data_pair(auto_ack=False)
+    tunnel = b.peer(0x01).signal_tunnel
+    parts = chunks(77, blob(1, "a", PNG))
+
+    for one in parts:
+        tunnel.on_frame(one)
+
+    pygospel.time.sleep((pygospel.DATA_WAIT + 1) / 1000.0)
+
+    for one in parts:
+        tunnel.on_frame(one)
+
+    check("again", len(got), 2)
+
+    a.close()
+    b.close()
+
+
+def test_data_ack_bits():
+    a, b, got = data_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+    parts = chunks(78, blob(1, "a", b"x" * 1152 * 20))
+    frames = []
+
+    tunnel.send_frame = lambda frame: frames.append(frame)
+
+    for idx in (0, 1, 3, 5):
+        tunnel.on_frame(parts[idx])
+
+    tunnel._data_ack(78, tunnel.rxfer, len(parts))
+
+    msgid, length, kind, payload = pygospel.frame_unpack(frames[-1])
+    base, latest = pygospel.DATA_ACK_HEAD.unpack_from(payload, 0)
+
+    check("id", msgid, 78)
+    check("length", length, 512)
+    check("kind", kind, pygospel.TYPE_DATA_ACK)
+    check("base", base, 2)
+    check("latest", latest, 5)
+    check("bits past the base", payload[8] & 0x0f, 0b0101)
+
+    a.close()
+    b.close()
+
+
+def test_group_data():
+    fresh()
+
+    a = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        group=0x0007)
+    b = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        group=0x0007, take_data=True)
+    got = []
+
+    b.on_data = got.append
+    pump([a, b], rounds=8)
+
+    tunnel = b.peer(0x01).group_tunnel
+
+    for one in chunks(80, blob(pygospel.DATA_VOICE, "v", b"data")):
+        tunnel.on_frame(one)
+
+    check("the group", got[0].group, 0x0007)
+    check("where", got[0].where, "01@0007")
+
+    a.close()
+    b.close()
+
+
 def main():
     tests = [(name, fn) for name, fn in sorted(globals().items())
         if name.startswith("test_") and callable(fn)]

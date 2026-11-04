@@ -10,12 +10,13 @@ vigil-python.
 It speaks gospel over sanctum tunnels, it is compatible with
 [Vigil](https://github.com/jorisvink/vigil) and with
 the [gospel](https://github.com/jorisvink/gospel) project. It does text both
-ways and sends images, see [Images](#images): no calls, no files, and it does
-not receive data. It never announces that it can take data or avatars, so a
-Vigil peer that has one for you sends you a message saying so instead, which
-is what Vigil already does for a peer that cannot take data. The one bit it
-will set is the signed-name bit, and only when it has a name that verifies,
-see [Signed names](#signed-names).
+ways, sends images and can receive data, see [Images](#images) and
+[Receiving data](#receiving-data). It does no calls. Unless you ask it to take
+data it never announces that it can, so a Vigil peer that has something for
+you sends you a message saying so instead, which is what Vigil already does
+for a peer that cannot take data. The other bit it will set is the signed-name
+bit, and only when it has a name that verifies, see
+[Signed names](#signed-names).
 
 ```python
 import pygospel
@@ -174,6 +175,19 @@ does and `on_sent`, `on_delivered` and `on_group_delivered` follow it, with
 the file name in `msg.name`. A peer that does not take data, such as gospel,
 gets a message saying it was sent an image instead.
 
+# Receiving data
+
+```python
+chat = pygospel.GospelChat("gospel.conf", take_data=True)
+chat.on_data = lambda msg: open(msg.name, "wb").write(msg.data)
+```
+
+`msg.media` is `image`, `file` or `voice`, `msg.name` the file name its sender
+gave it and `msg.data` the bytes, at most 4 MiB. The name came from a peer, so
+treat it like anything else that did. With `auto_ack=False` call `msg.ack()`
+once you have kept it, or it comes again after a minute. Avatars are acked and
+dropped.
+
 # Signed names
 
 A configuration made by Covenant carries a name for the device that the
@@ -235,6 +249,7 @@ Hooks can be methods on a subclass or plain functions on the instance:
 | hook | when |
 |---|---|
 | `on_message(msg)` | a message arrived |
+| `on_data(msg)` | an image, file or voice message arrived |
 | `on_sent(ref, msg)` | one of ours left for a peer |
 | `on_delivered(ref, msg)` | a peer stored one of ours |
 | `on_group_delivered(ref, group, acked, pending)` | the group tally moved |
@@ -271,6 +286,7 @@ Constructor options beyond `config` and `nickname`:
 | `cathedrals` | `[(host, port), ...]` instead of the configured one |
 | `signal_all` | signal every device in the flock |
 | `discoverable` | show up as a peer for devices using the same `liturgy_group` |
+| `take_data` | receive images, files and voice messages through `on_data` |
 | `features` | bits to announce; none by default, plus the name bit when the signature verifies |
 
 With `auto_ack=False` nothing is acknowledged until you say you kept it,
@@ -317,6 +333,22 @@ the only ones it answers.
 
 An agent sends an image by putting `[image: path]` on a line of its own in
 its answer. The path is relative to `--dir` and has to stay inside it.
+
+Images and files sent to an agent are kept under
+`~/.local/state/vigil-python/inbox`, and the agent is told where. They stay
+there until you remove them. A voice message becomes a prompt with
+`--transcribe`, a command that prints the words of the audio file it is given:
+
+```
+$ python3 -m venv ~/whisper
+$ ~/whisper/bin/pip install faster-whisper 'av<16'
+$ python3 examples/agent.py -c gospel.conf -a 02 \
+    --transcribe "$HOME/whisper/bin/python tools/transcribe.py"
+```
+
+That runs on this machine, and the audio is deleted once it has its words. A
+transcript is marked as one, so it cannot run a command or answer a permission
+question. In a group an agent only takes data with `--group-all`.
 
 `--backend claude` runs Claude Code instead of `pi`. Anything its permission
 rules do not already allow comes to the chat as a question showing what it
@@ -415,6 +447,7 @@ Your neighborhood LLM
 | `tests/smoke.py` | the same against the real libkyrka |
 | `examples/` | a terminal client, an echo bot, a flock watcher, an agent peer |
 | `tools/cathedral/` | fetches sanctum, runs a cathedral, talks to it |
+| `tools/transcribe.py` | the words of an audio file, for agents |
 | `tools/check-style.py` | tabs, alignment and column checks |
 | `tools/align.py` | applies what check-style.py asks for |
 | `dist-build/` | fetching, patching and building libkyrka and sanctum |
