@@ -67,6 +67,7 @@ def ok(what, condition):
 
 class Chat:
     spi = 0x07
+    group = 0x0007
 
     def __init__(self):
         self.said = []
@@ -135,7 +136,7 @@ class Quiet(agent.ClaudeAgent):
 
 def opts(tmp, **kwargs):
     fields = dict(claude="claude", dir="/work", model=None, idle=900,
-        max_out=4096, progress=False, transcribe=None,
+        max_out=4096, progress=False, stats=0, transcribe=None,
         inbox=os.path.join(tmp, "inbox"),
         sessions=os.path.join(tmp, "state", "sessions.json"))
     fields.update(kwargs)
@@ -243,6 +244,609 @@ def test_anything_else_keeps_waiting():
 
         check("nothing went to the child", len(one.out()), 1)
         ok("said so", "waiting for an answer" in chat.said[-1])
+
+
+class QuietPi(agent.PiAgent):
+    """A PiAgent writing to a buffer rather than to a child."""
+
+    def start(self):
+        self.proc = Proc()
+
+
+def said(role, text):
+    return {"role": role, "content": [{"type": "text", "text": text}]}
+
+
+def test_pi_answer_keeps_text_before_a_tool():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Chat()
+        one = QuietPi(chat, "p02", opts(tmp))
+
+        one.feed(message("what did you find"))
+        one.dispatch({"type": "message_end",
+            "message": said("assistant", "1. the first")})
+        one.dispatch({"type": "message_end",
+            "message": said("toolResult", "not for the chat")})
+        one.dispatch({"type": "message_end",
+            "message": said("assistant", "2. the second")})
+        one.dispatch({"type": "agent_settled"})
+
+        check("all of it", chat.said, ["1. the first\n\n2. the second"])
+
+
+class Quoting(Chat):
+    """A chat that also keeps which message each reply is quoted onto."""
+
+    def __init__(self):
+        super().__init__()
+        self.quoted = []
+
+    def reply(self, peer, text, msg):
+        self.quoted.append((msg.text, text))
+        super().reply(peer, text, msg)
+
+    def reply_group(self, text, msg):
+        self.quoted.append((msg.text, text))
+        super().reply_group(text, msg)
+
+
+def quiet_pi(tmp, key="p02", chat=None):
+    chat = chat or Quoting()
+
+    return chat, QuietPi(chat, key, opts(tmp))
+
+
+def prompts(one):
+    lines = one.proc.stdin.getvalue().splitlines()
+
+    return [rec["message"] for rec in map(json.loads, lines)
+        if rec.get("type") == "prompt"]
+
+
+def pi_says(one, text):
+    one.dispatch({"type": "message_end", "message": said("assistant", text)})
+
+
+def test_pi_answers_each_message_in_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp)
+
+        one.feed(message("job one"))
+        pi_says(one, "working on one")
+        one.feed(message("job two"))
+        one.feed(message("job three"))
+
+        check("one at a time", prompts(one), ["job one"])
+        for line in one.proc.stdin.getvalue().splitlines():
+            ok("no steering", "streamingBehavior" not in json.loads(line))
+
+        one.dispatch({"type": "agent_settled"})
+        check("the second goes in", prompts(one), ["job one", "job two"])
+
+        pi_says(one, "two is done")
+        one.dispatch({"type": "agent_settled"})
+        pi_says(one, "three is done")
+        one.dispatch({"type": "agent_settled"})
+
+        check("each on its own prompt", chat.quoted, [
+            ("job one", "working on one"), ("job two", "two is done"),
+            ("job three", "three is done")])
+        ok("idle", not one.busy)
+
+
+def test_pi_handled_prompt_does_not_block_the_queue():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp)
+
+        one.feed(message("/ext thing"))
+        one.feed(message("job two"))
+
+        first = json.loads(one.proc.stdin.getvalue().splitlines()[0])
+
+        one.dispatch({"type": "response", "id": first["id"],
+            "command": "prompt", "success": True,
+            "data": {"disposition": "handled"}})
+
+        check("the next one goes in", prompts(one), ["/ext thing", "job two"])
+        check("its turn", one.running.text, "job two")
+
+
+def test_pi_refused_prompt_does_not_block_the_queue():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp)
+
+        one.feed(message("job one"))
+        one.feed(message("job two"))
+
+        first = json.loads(one.proc.stdin.getvalue().splitlines()[0])
+
+        one.dispatch({"type": "response", "id": first["id"],
+            "command": "prompt", "success": False, "error": "no model"})
+
+        ok("says why", "no model" in chat.said[-1])
+        check("the next one goes in", one.running.text, "job two")
+
+
+def test_abort_drops_what_waits():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp)
+
+        one.feed(message("job one"))
+        one.feed(message("job two"))
+        one.abort(message("/abort"))
+
+        ok("says so", "dropping 1 message" in chat.said[-1])
+
+        one.dispatch({"type": "agent_settled", "aborted": True})
+
+        check("nothing else went in", prompts(one), ["job one"])
+        ok("idle", not one.busy)
+
+
+def test_agent_going_away_says_what_it_dropped():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp)
+
+        one.feed(message("job one"))
+        one.feed(message("job two"))
+        one.eof()
+
+        ok("says so", "dropping 1 message" in chat.said[-1])
+        check("nothing left", one.waiting, [])
+
+
+def dialog(id="d1", method="confirm", **kwargs):
+    rec = {"type": "extension_ui_request", "id": id, "method": method,
+        "title": "run %s?" % id}
+    rec.update(kwargs)
+
+    return rec
+
+
+def ui_responses(one):
+    lines = one.proc.stdin.getvalue().splitlines()
+
+    return [rec for rec in map(json.loads, lines)
+        if rec.get("type") == "extension_ui_response"]
+
+
+def test_pi_only_the_asker_answers_a_dialog():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp, "g0007")
+
+        one.feed(message("job one", author=0x02, group=0x0007))
+        one.dispatch(dialog())
+        one.feed(message("what is the weather", author=0x03, group=0x0007))
+
+        ok("told", "only 02 can answer" in chat.said[-1])
+        check("still asked", ui_responses(one), [])
+        ok("another is not awaited",
+            not one.awaits(message("yes", author=0x03, group=0x0007)))
+        ok("the asker is awaited",
+            one.awaits(message("yes", author=0x02, group=0x0007)))
+
+        one.feed(message("yes", author=0x02, group=0x0007))
+
+        check("answered", ui_responses(one)[0]["confirmed"], True)
+
+
+def test_pi_a_question_belongs_to_the_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp, "g0007")
+
+        one.feed(message("job one", author=0x02, group=0x0007))
+        one.dispatch(dialog())
+
+        check("from who started it", one.dialog["from"], 0x02)
+
+
+def test_pi_dialogs_stack():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp)
+
+        one.feed(message("job one"))
+        one.dispatch(dialog("d1"))
+        one.dispatch(dialog("d2"))
+
+        ok("the first", "run d1?" in chat.said[-1])
+        check("one question out", sum("run d" in x for x in chat.said), 1)
+
+        one.feed(message("yes"))
+
+        ok("the second", "run d2?" in chat.said[-1])
+
+        one.feed(message("no"))
+
+        check("both answered", [(r["id"], r["confirmed"])
+            for r in ui_responses(one)], [("d1", True), ("d2", False)])
+
+
+def test_pi_abort_lets_go_of_dialogs():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp)
+
+        one.feed(message("job one"))
+        one.dispatch(dialog("d1"))
+        one.dispatch(dialog("d2"))
+        one.abort(message("/abort"))
+
+        check("both cancelled", [(r["id"], r["cancelled"])
+            for r in ui_responses(one)], [("d1", True), ("d2", True)])
+
+
+def test_pi_dialog_that_timed_out_takes_nothing():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = quiet_pi(tmp)
+
+        one.feed(message("job one"))
+        one.dispatch(dialog("d1", timeout=1000))
+        one.dialog["until"] = agent.time.monotonic() - 1
+        one.feed(message("job two"))
+
+        check("not an answer", ui_responses(one), [])
+        check("it waits its turn", [m.text for m in one.waiting], ["job two"])
+
+
+def test_claude_question_belongs_to_the_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Chat()
+        one = Quiet(chat, "g0007", opts(tmp))
+
+        one.feed(message("job one", author=0x02, group=0x0007))
+        one.dispatch({"type": "system", "subtype": "init", "model": "m1",
+            "session_id": one.session_id})
+        one.feed(message("job two", author=0x03, group=0x0007))
+        one.dispatch(permission())
+
+        check("from who started it", one.asked["from"], 0x02)
+
+
+def test_claude_trust_is_for_the_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Chat()
+        one = Quiet(chat, "g0007", opts(tmp))
+
+        one.trusted.add(0x03)
+        one.feed(message("job one", author=0x02, group=0x0007))
+        one.dispatch({"type": "system", "subtype": "init", "model": "m1",
+            "session_id": one.session_id})
+        one.feed(message("job two", author=0x03, group=0x0007))
+        one.dispatch(permission())
+
+        ok("not allowed on 03's word", one.asked is not None)
+
+
+class Empty(Chat):
+    """A group nobody is around in, until somebody is."""
+
+    def __init__(self):
+        super().__init__()
+        self.around = False
+
+    def send_group(self, text):
+        if not self.around:
+            raise pygospel.GospelError("no member of the group to send to")
+
+        super().send_group(text)
+
+    def reply_group(self, text, msg):
+        if not self.around:
+            raise pygospel.GospelError("no member of the group to send to")
+
+        super().reply_group(text, msg)
+
+
+def test_group_answer_waits_for_somebody():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Empty()
+        one = QuietPi(chat, "g0007", opts(tmp))
+        msg = message("job one", group=0x0007)
+
+        one.feed(msg)
+        one.running = msg
+        one.deliver("the answer")
+        one.tell(msg, "and a note")
+
+        check("nothing yet", chat.said, [])
+        ok("kept around", not one.expired(one.idle + 100000))
+
+        one.flush(agent.time.monotonic())
+        check("still nothing", chat.said, [])
+
+        chat.around = True
+        one.flush(agent.time.monotonic())
+
+        check("in order", chat.said, ["the answer", "and a note"])
+        check("all of it", one.unsent, [])
+
+
+def test_group_answer_gives_up_in_the_end():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Empty()
+        one = QuietPi(chat, "g0007", opts(tmp))
+        msg = message("job one", group=0x0007)
+
+        one.tell(msg, "a note")
+        chat.around = True
+        one.flush(agent.time.monotonic() + agent.UNSENT_MAX + 1)
+
+        check("dropped", chat.said, [])
+        check("nothing kept", one.unsent, [])
+
+
+def test_answer_stays_out_of_another_group():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Chat()
+        one = QuietPi(chat, "g0009", opts(tmp))
+
+        one.tell(message("job one", group=0x0009), "for the old group")
+
+        check("not said", chat.said, [])
+        check("not kept", one.unsent, [])
+
+
+def test_one_to_one_answer_is_not_held():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Chat()
+        one = QuietPi(chat, "p02", opts(tmp))
+
+        def refuse(peer, text):
+            raise pygospel.GospelError("no")
+
+        chat.send = refuse
+        one.tell(message("job one"), "a note")
+
+        check("nothing kept", one.unsent, [])
+
+
+def test_pi_answer_does_not_carry_over():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Chat()
+        one = QuietPi(chat, "p02", opts(tmp))
+
+        one.feed(message("job one"))
+        one.dispatch({"type": "message_end",
+            "message": said("assistant", "one is done")})
+        one.dispatch({"type": "agent_settled"})
+        one.feed(message("job two"))
+        one.dispatch({"type": "message_end",
+            "message": said("assistant", "two is done")})
+        one.dispatch({"type": "agent_settled"})
+
+        check("one answer each", chat.said, ["one is done", "two is done"])
+
+
+def test_claude_answer_keeps_text_before_a_tool():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = running(tmp)
+
+        one.dispatch({"type": "assistant",
+            "message": said("assistant", "1. the first")})
+        one.dispatch({"type": "assistant",
+            "message": said("assistant", "2. the second")})
+        one.dispatch(result("2. the second"))
+
+        check("all of it, the result once", chat.said,
+            ["1. the first\n\n2. the second"])
+
+
+def test_claude_result_says_what_messages_did_not():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = running(tmp)
+
+        one.dispatch({"type": "assistant",
+            "message": said("assistant", "working on it")})
+        one.dispatch(result("the limit was hit"))
+
+        check("both", chat.said, ["working on it\n\nthe limit was hit"])
+
+
+def out_of(one):
+    return [json.loads(x) for x in one.proc.stdin.getvalue().splitlines()]
+
+
+def stats_pi(tmp):
+    chat = Chat()
+    one = QuietPi(chat, "p02", opts(tmp, stats=60))
+
+    one.feed(message("job one"))
+
+    return chat, one
+
+
+def stats_asked(one):
+    return [rec for rec in out_of(one)
+        if rec.get("type") == "get_session_stats"]
+
+
+def test_span_and_short():
+    check("seconds", agent.span(45), "45s")
+    check("minutes", agent.span(192), "3m12s")
+    check("hours", agent.span(3840), "1h04m")
+    check("few", agent.short(812), "812")
+    check("thousands", agent.short(52400), "52k")
+    check("millions", agent.short(1234567), "1.2M")
+
+
+def test_pi_stats_come_when_due():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = stats_pi(tmp)
+
+        one.check_stats(one.started + 59)
+        check("not yet", stats_asked(one), [])
+
+        one.dispatch({"type": "tool_execution_start", "toolName": "bash",
+            "args": {"command": "make"}})
+        one.check_stats(one.started + 61)
+        check("asked", len(stats_asked(one)), 1)
+        one.check_stats(one.started + 62)
+        check("once", len(stats_asked(one)), 1)
+
+        one.dispatch({"type": "response", "command": "get_session_stats",
+            "id": stats_asked(one)[0]["id"], "success": True, "data": {
+            "tokens": {"total": 105000}, "cost": 0.45,
+            "contextUsage": {"tokens": 60000, "percent": 30}}})
+
+        ok("the time", chat.said[-1].startswith("working "))
+        ok("the tools", "1 tool, last bash" in chat.said[-1])
+        ok("the context", "context 30%" in chat.said[-1])
+        ok("the tokens", "105k tokens this session" in chat.said[-1])
+        ok("the cost", "$0.45" in chat.said[-1])
+
+
+def test_pi_stats_leave_out_what_it_does_not_know():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = stats_pi(tmp)
+
+        one.check_stats(one.started + 61)
+        one.dispatch({"type": "response", "command": "get_session_stats",
+            "id": stats_asked(one)[0]["id"], "success": True, "data": {
+            "tokens": {"total": 0}, "cost": 0,
+            "contextUsage": {"tokens": None, "percent": None}}})
+
+        check("only the time", chat.said[-1].split(" ")[0], "working")
+        check("nothing else", chat.said[-1].count(","), 0)
+
+
+def test_pi_stats_failing_is_no_complaint():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = stats_pi(tmp)
+
+        one.check_stats(one.started + 61)
+        one.dispatch({"type": "response", "command": "get_session_stats",
+            "id": stats_asked(one)[0]["id"], "success": False, "error": "no"})
+
+        check("still a line", len(chat.said), 1)
+        ok("not an error", chat.said[0].startswith("working "))
+        ok("not stuck", not one.stats_asked)
+
+
+def test_pi_stats_when_pi_does_not_answer():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = stats_pi(tmp)
+
+        one.check_stats(one.started + 61)
+        check("nothing yet", chat.said, [])
+
+        one.check_stats(one.started + 122)
+        ok("says so", "pi is not answering" in chat.said[-1])
+        check("asked once", len(stats_asked(one)), 1)
+
+
+def test_stats_after_the_turn_are_dropped():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = stats_pi(tmp)
+
+        one.check_stats(one.started + 61)
+        pi_says(one, "done")
+        one.dispatch({"type": "agent_settled"})
+        chat.said.clear()
+
+        one.dispatch({"type": "response", "command": "get_session_stats",
+            "id": stats_asked(one)[0]["id"], "success": True, "data": {}})
+
+        check("nothing said", chat.said, [])
+
+        one.check_stats(one.started + 1000)
+        check("nothing asked", len(stats_asked(one)), 1)
+
+
+def test_stats_are_quiet_during_a_question():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = stats_pi(tmp)
+
+        one.dispatch(dialog())
+        one.check_stats(one.started + 61)
+
+        check("not asked", stats_asked(one), [])
+
+
+def test_stats_can_be_off():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = Chat()
+        one = QuietPi(chat, "p02", opts(tmp, stats=0))
+
+        one.feed(message("job one"))
+        one.check_stats(one.started + 100000)
+
+        check("not asked", stats_asked(one), [])
+
+
+def test_stats_start_over_each_turn():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = stats_pi(tmp)
+
+        one.dispatch({"type": "tool_execution_start", "toolName": "bash"})
+        pi_says(one, "done")
+        one.dispatch({"type": "agent_settled"})
+        one.feed(message("job two"))
+
+        check("no tools yet", one.tools, 0)
+        check("the time too", one.stats_at, one.started)
+
+
+def test_stats_show_what_waits():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = stats_pi(tmp)
+
+        one.feed(message("job two"))
+        one.check_stats(one.started + 61)
+        one.dispatch({"type": "response", "command": "get_session_stats",
+            "id": stats_asked(one)[0]["id"], "success": True, "data": {}})
+
+        ok("the queue", chat.said[-1].endswith(", 1 waiting"))
+
+
+def test_claude_stats_add_up_the_usage():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = running(tmp)
+
+        one.opts.stats = 60
+
+        def usage(id, output, cached):
+            return {"type": "assistant", "message": {"id": id, "content": [],
+                "usage": {"input_tokens": 2, "output_tokens": output,
+                "cache_read_input_tokens": cached,
+                "cache_creation_input_tokens": 1000}}}
+
+        one.dispatch(usage("m1", 100, 10000))
+        one.dispatch(usage("m1", 100, 10000))
+        one.dispatch(usage("m2", 1500, 40000))
+        one.dispatch({"type": "assistant", "message": {"id": "m3", "content": [
+            {"type": "tool_use", "name": "Read", "input": {"path": "x"}}]}})
+
+        one.check_stats(one.started + 61)
+
+        ok("the last context", "context 41k tokens" in chat.said[-1])
+        ok("each message once", "1k written" in chat.said[-1])
+        ok("the tools", "1 tool, last Read" in chat.said[-1])
+
+        one.dispatch(result("done"))
+        one.feed(message("job two"))
+
+        check("a new turn starts over", one.usages, {})
+
+
+def test_claude_stats_without_usage():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = running(tmp)
+
+        one.opts.stats = 60
+        one.check_stats(one.started + 61)
+
+        check("only the time", chat.said[-1].count(","), 0)
+
+
+def test_claude_stats_are_quiet_during_a_question():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one = running(tmp)
+
+        one.opts.stats = 60
+        one.dispatch(permission())
+        said = len(chat.said)
+        one.check_stats(one.started + 61)
+
+        check("nothing said", len(chat.said), said)
 
 
 def test_only_the_asker_answers():
@@ -410,22 +1014,45 @@ def test_failure_is_reported():
         ok("says why", "too many" in chat.said[-1])
 
 
-def test_steering_shares_a_turn():
+def test_a_message_waits_for_its_turn():
     with tempfile.TemporaryDirectory() as tmp:
         chat, one = running(tmp)
 
         one.feed(message("and also this"))
 
-        check("goes in", one.out()[-1]["message"]["content"], "and also this")
+        check("not yet", len(one.out()), 1)
+        check("says so", chat.said, ["message queued (1/1 pending)"])
 
-        one.dispatch(result("both"))
+        one.feed(message("and this"))
+
+        check("counts", chat.said[-1], "message queued (2/2 pending)")
+
+        chat.said.clear()
+        one.dispatch(result("first"))
+
+        check("the first answer", chat.said, ["first"])
+        check("now it goes in", one.out()[-1]["message"]["content"],
+            "and also this")
+        check("its turn", one.running.text, "and also this")
+        ok("still busy", one.busy)
+
+        one.feed(message("and one more"))
+
+        check("counts what is left", chat.said[-1],
+            "message queued (2/2 pending)")
+
+        chat.said.clear()
+        one.dispatch(result("second"))
+        one.dispatch(result("third"))
+        one.dispatch(result("fourth"))
         one.dispatch(result("more"))
 
-        check("the first", chat.said[-2], "both")
-        check("a late one still arrives", chat.said[-1], "more")
+        check("a late one still arrives", chat.said, ["second", "third",
+            "fourth", "more"])
+        ok("idle", not one.busy)
 
 
-def test_only_the_final_text_arrives():
+def test_a_subagent_stays_out_of_the_answer():
     with tempfile.TemporaryDirectory() as tmp:
         chat, one = running(tmp)
 
@@ -599,7 +1226,7 @@ def test_image_line():
     with tempfile.TemporaryDirectory() as tmp:
         one, chat, root = image_agent(tmp)
 
-        one.targets = [message("draw it")]
+        one.running = message("draw it")
         one.deliver("here it is\n[image: plot.png]\n  [image: %s]  " %
             os.path.join(root, "plot.png"))
 
@@ -612,7 +1239,7 @@ def test_image_only():
     with tempfile.TemporaryDirectory() as tmp:
         one, chat, root = image_agent(tmp)
 
-        one.targets = [message("draw it")]
+        one.running = message("draw it")
         one.deliver("[image: plot.png]")
 
         check("no text", chat.said, [])
@@ -623,7 +1250,7 @@ def test_image_in_a_sentence_is_text():
     with tempfile.TemporaryDirectory() as tmp:
         one, chat, root = image_agent(tmp)
 
-        one.targets = [message("how")]
+        one.running = message("how")
         one.deliver("write [image: plot.png] on a line")
 
         check("left alone", chat.said, ["write [image: plot.png] on a line"])
@@ -643,7 +1270,7 @@ def test_image_stays_in_the_folder():
 
         for path in (out, "../out.png", "link.png",
             os.path.join(root + "-other", "x.png")):
-            one.targets = [message("draw it")]
+            one.running = message("draw it")
             chat.said = []
             one.deliver("[image: %s]" % path)
 
@@ -661,7 +1288,7 @@ def test_image_failure_is_told():
             raise pygospel.GospelError("not a PNG")
 
         chat.send_image = refuse
-        one.targets = [message("draw it")]
+        one.running = message("draw it")
         one.deliver("[image: plot.png]")
 
         check("the reason", chat.said, ["cannot send plot.png: not a PNG"])
@@ -674,7 +1301,7 @@ def test_image_in_a_group():
         os.makedirs(root)
 
         one = Quiet(chat, "g0007", opts(tmp, dir=root))
-        one.targets = [message("draw it", group=0x0007)]
+        one.running = message("draw it", group=0x0007)
         one.deliver("[image: plot.png]")
 
         check("to the group", chat.images,

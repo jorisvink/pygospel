@@ -158,7 +158,8 @@ chat.on_left(peer)
 chat.on_group_delivered(ref, group, acked, pending)
 ```
 
-A group message goes to whoever is online at that moment and nowhere else.
+A group message goes to the members we have a tunnel with, one whose tunnel is
+down gets it when it comes back, and nothing is kept for a member that left.
 `on_group_delivered` counts down as they acknowledge it.
 
 # Images
@@ -185,8 +186,29 @@ chat.on_data = lambda msg: open(msg.name, "wb").write(msg.data)
 `msg.media` is `image`, `file` or `voice`, `msg.name` the file name its sender
 gave it and `msg.data` the bytes, at most 4 MiB. The name came from a peer, so
 treat it like anything else that did. With `auto_ack=False` call `msg.ack()`
-once you have kept it, or it comes again after a minute. Avatars are acked and
-dropped.
+once you have kept it, or it comes again after a minute. A peer's avatar comes
+through the same channel but not through `on_data`, see [Avatars](#avatars).
+
+# Avatars
+
+```python
+chat.set_avatar("face.png")
+chat.set_avatar(None)
+print(chat.peer(0x02).avatar)
+```
+
+An avatar is the picture a device shows for itself: a path or bytes holding a
+PNG, JPEG, GIF or WebP of at most 32 KiB, which is what Vigil calls
+`VIGIL_CHAT_AVATAR_MAX`. It is not a message. It holds no place in an outbox,
+goes to every tunnel that takes data once the data waiting there has gone, and
+gets no `on_sent` or `on_delivered`. Peers learn you have one from a bit in the
+heartbeat, so taking it away is enough to make them drop it. Heartbeats also
+say which picture a peer already holds of you, so a tunnel coming back up does
+not send it again; a peer that restarted or that predates this gets it anew.
+
+What a peer sends lands in `peer.avatar`, and `on_avatar(peer)` says it
+happened, both when it arrives and when the peer stops announcing one. Avatars
+ride the data channel, so you take them with `take_data=True`.
 
 # Signed names
 
@@ -250,6 +272,7 @@ Hooks can be methods on a subclass or plain functions on the instance:
 |---|---|
 | `on_message(msg)` | a message arrived |
 | `on_data(msg)` | an image, file or voice message arrived |
+| `on_avatar(peer)` | a peer's picture arrived, or it took it away |
 | `on_sent(ref, msg)` | one of ours left for a peer |
 | `on_delivered(ref, msg)` | a peer stored one of ours |
 | `on_group_delivered(ref, group, acked, pending)` | the group tally moved |
@@ -327,7 +350,7 @@ flock and says who is reachable and how.
 it to a `pi --mode rpc` child, one per conversation and one session each,
 and answers with what the agent comes back with. The agent works in the
 folder `--dir` names, its answer is split to fit messages of 512 bytes, a
-message sent while it is working steers it, and `/abort`, `/status`,
+message sent while it is working waits for its own turn, and `/abort`, `/status`,
 `/model` and `/new` are there to type into a chat. Devices in `--allow` are
 the only ones it answers.
 
@@ -349,6 +372,20 @@ $ python3 examples/agent.py -c gospel.conf -a 02 \
 That runs on this machine, and the audio is deleted once it has its words. A
 transcript is marked as one, so it cannot run a command or answer a permission
 question. In a group an agent only takes data with `--group-all`.
+
+While a job runs, the agent says how it is doing every minute: how long it has
+been at it, how many tools it ran, the last one, and what the backend reports.
+That is context use, session tokens and cost for `pi`, context and tokens
+written for Claude Code. A job shorter than that says nothing, and neither does
+one waiting on an answer from the chat. `--stats` sets the seconds between
+lines, 0 turns them off.
+
+An agent shows no avatar of its own unless you give it one, and it only logs
+the ones peers send:
+
+```
+$ python3 examples/agent.py -c gospel.conf --avatar ~/face.png
+```
 
 `--backend claude` runs Claude Code instead of `pi`. Anything its permission
 rules do not already allow comes to the chat as a question showing what it

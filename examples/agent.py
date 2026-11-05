@@ -57,6 +57,7 @@ ASK_NO       = ("n", "no")
 ASK_ALL      = ("yes to all", "yes all")
 ASK_MAX      = 1500
 VOICE_MAX    = 300
+UNSENT_MAX   = 900
 IMAGE_LINE   = re.compile(r"^[ \t]*\[image:[ \t]*(.+?)[ \t]*\][ \t]*$", re.M)
 
 # The session a child must not inherit: those describe whoever started this
@@ -72,7 +73,7 @@ CLAUDE_VARS = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT",
 HELP = """\
   <text>          a job for the agent
   /status         model, whether it is working, how long the session is
-  /abort          stop what it is doing
+  /abort          stop what it is doing and drop what waits behind it
   /new            start a fresh session
   /model <name>   switch model, as provider/id for pi, like sonnet for claude
   /idle <mins>    how long a session waits between messages
@@ -123,6 +124,32 @@ def chunk(text, limit):
     return [piece.decode("utf-8", "replace") for piece in out if piece.strip()]
 
 
+def span(seconds):
+    """A length of time the way a person says it: 45s, 3m12s, 1h04m."""
+
+    seconds = int(seconds)
+
+    if seconds < 60:
+        return "%ds" % seconds
+
+    if seconds < 3600:
+        return "%dm%02ds" % (seconds // 60, seconds % 60)
+
+    return "%dh%02dm" % (seconds // 3600, seconds % 3600 // 60)
+
+
+def short(count):
+    """A token count that fits a chat line: 812, 52k, 1.2M."""
+
+    if count < 1000:
+        return "%d" % count
+
+    if count < 1000000:
+        return "%dk" % (count // 1000)
+
+    return "%.1fM" % (count / 1000000)
+
+
 def agent_text(message):
     """The readable part of an assistant message, thinking left out."""
 
@@ -162,6 +189,15 @@ def parse_ids(text):
     return ids
 
 
+class Unsent(Exception):
+    """A piece the chat would not take, and how many went before it."""
+
+    def __init__(self, sent, error):
+        super().__init__(str(error))
+        self.sent = sent
+        self.error = error
+
+
 class Agent:
     """
     One conversation: a child process and the messages waiting on it.
@@ -170,6 +206,10 @@ class Agent:
     go out and events come back on the loop the tunnels run on, with no
     thread and no second timer. A subclass knows how to talk to one kind of
     child, this class knows how to talk to the chat.
+
+    The child gets one message at a time. Anything that arrives during a turn
+    waits for its own, so every message gets its own answer quoted onto it,
+    and whatever the child asks along the way belongs to whoever started it.
     """
 
     ENV_DROP = ()
@@ -190,11 +230,18 @@ class Agent:
         self.seq = 0
         self.busy = False
         self.gone = False
-        self.targets = []
+        self.running = None
+        self.waiting = []
+        self.unsent = []
         self.last = None
         self.answer = None
         self.ticks = 0
         self.told = 0
+        self.started = 0
+        self.stats_at = 0
+        self.stats_asked = False
+        self.tools = 0
+        self.tool = None
         self.idle = time.monotonic()
 
         self.start()
@@ -303,24 +350,62 @@ class Agent:
         if self.answered(msg):
             return
 
+        if self.busy:
+            self.waiting.append(msg)
+            self.tell(msg, "message queued (%d/%d pending)"
+                % (len(self.waiting), len(self.waiting)))
+        else:
+            self.begin(msg)
+
+    def begin(self, msg):
+        """Start the turn of one message, the only one the child sees."""
+
         self.last = msg
-        self.targets.append(msg)
+        self.running = msg
         self.answer = None
         self.ticks = 0
         self.told = time.monotonic()
+        self.started = self.told
+        self.stats_at = self.told
+        self.stats_asked = False
+        self.tools = 0
+        self.tool = None
+        self.busy = True
+        self.typing(True)
 
-        steer = self.busy
+        if self.submit(msg):
+            return
 
-        if not steer:
-            self.typing(True)
-            self.busy = True
-
-        if not self.submit(msg, steer):
-            self.busy = False
-            self.gone = True
-            self.typing(False)
+        if self.running is not None:
             self.tell(msg, "this peer has no agent running, its log says "
                 "why")
+
+        self.running = None
+        self.busy = False
+        self.gone = True
+        self.typing(False)
+
+    def finish(self):
+        """This turn is over, the oldest message waiting gets the next one."""
+
+        self.running = None
+        self.busy = False
+        self.typing(False)
+
+        if self.waiting and not self.gone:
+            self.begin(self.waiting.pop(0))
+
+    def drop_waiting(self):
+        """Forget the messages waiting for a turn, and say how many it was."""
+
+        count = len(self.waiting)
+        self.waiting = []
+
+        if count == 0:
+            return ""
+
+        return ", dropping %d message%s waiting" % (count,
+            "" if count == 1 else "s")
 
     def command(self, msg, head, rest):
         """The few things a peer asks the bridge rather than the agent."""
@@ -349,6 +434,9 @@ class Agent:
         self.tell(msg, "agents go quiet after %d minutes without a message"
             % (self.opts.idle // 60))
 
+    def waiting_text(self):
+        return ", %d waiting" % len(self.waiting) if self.waiting else ""
+
     def prompt_of(self, msg):
         if not self.in_group:
             return msg.text
@@ -361,8 +449,20 @@ class Agent:
         except pygospel.GospelError:
             pass
 
-    def latest(self):
-        return self.targets[-1] if self.targets else None
+    def owner(self):
+        """The message what the child says now belongs to."""
+
+        return self.running or self.last
+
+    def add_answer(self, text):
+        """
+        Keep what one assistant message said. A run can say something before
+        each tool it calls, and all of that is the answer, not only its end.
+        """
+
+        if text:
+            self.answer = "%s\n\n%s" % (self.answer, text) if self.answer \
+                else text
 
     #
     # Telling the chat about it.
@@ -380,6 +480,24 @@ class Agent:
                 log(piece)
             return
 
+        if msg.group is not None and msg.group != self.chat.group:
+            log("%s: not sending, we left that group" % msg.where)
+            return
+
+        if msg.group is not None and self.unsent:
+            self.unsent.append([msg, pieces, quoted, time.monotonic()])
+            return
+
+        try:
+            self.send_pieces(msg, pieces, quoted)
+        except Unsent as e:
+            log("%s: cannot send: %s" % (msg.where, e.error))
+
+            if msg.group is not None:
+                self.unsent.append([msg, pieces[e.sent:],
+                    quoted and e.sent == 0, time.monotonic()])
+
+    def send_pieces(self, msg, pieces, quoted):
         for n, piece in enumerate(pieces):
             try:
                 if msg.group is None:
@@ -392,8 +510,32 @@ class Agent:
                 else:
                     self.chat.reply_group(piece, msg)
             except pygospel.GospelError as e:
-                log("%s: cannot send: %s" % (msg.where, e))
+                raise Unsent(n, e)
+
+    def flush(self, now):
+        """
+        Try again what a group had nobody around for. A group keeps nothing
+        for a member that left its liturgy, so an answer waits here instead.
+        """
+
+        while self.unsent:
+            entry = self.unsent[0]
+            msg, pieces, quoted, since = entry
+
+            if now - since > UNSENT_MAX or msg.group != self.chat.group:
+                log("%s: gave up on sending %d message%s" % (msg.where,
+                    len(pieces), "" if len(pieces) == 1 else "s"))
+                self.unsent.pop(0)
+                continue
+
+            try:
+                self.send_pieces(msg, pieces, quoted)
+            except Unsent as e:
+                entry[1] = pieces[e.sent:]
+                entry[2] = quoted and e.sent == 0
                 return
+
+            self.unsent.pop(0)
 
     def tell(self, msg, text):
         """A line that is not the answer: an ack, a note, a failure."""
@@ -403,8 +545,7 @@ class Agent:
     def deliver(self, text):
         """The answer, quoted onto what it replies to and split to fit."""
 
-        msg = self.latest()
-        self.targets = []
+        msg = self.owner()
 
         images = IMAGE_LINE.findall(text)
         text = IMAGE_LINE.sub("", text).strip()
@@ -445,8 +586,41 @@ class Agent:
         except pygospel.GospelError as e:
             self.tell(msg, "cannot send %s: %s" % (path, e))
 
+    def asking(self):
+        """Whether the turn is waiting on an answer from the chat."""
+
+        return False
+
+    def check_stats(self, now):
+        """Say how a turn is doing, each time it has run for another while."""
+
+        if not self.opts.stats or self.running is None or self.asking() or \
+            self.unsent:
+            return
+
+        if now - self.stats_at < self.opts.stats:
+            return
+
+        self.stats_at = now
+        self.pull_stats()
+
+    def stats_line(self, details=()):
+        parts = ["working %s" % span(time.monotonic() - self.started)]
+
+        if self.tools:
+            parts.append("%d tool%s, last %s" % (self.tools,
+                "" if self.tools == 1 else "s", self.tool))
+
+        return ", ".join(parts + list(details)) + self.waiting_text()
+
     def progress(self, what, args):
-        if not self.busy or not self.opts.progress:
+        if not self.busy:
+            return
+
+        self.tools += 1
+        self.tool = what or "work"
+
+        if not self.opts.progress:
             return
 
         now = time.monotonic()
@@ -464,7 +638,7 @@ class Agent:
         what = what or "work"
         line = "%s: %s" % (what, detail) if detail else "%s..." % what
 
-        self.tell(self.latest(), line)
+        self.tell(self.owner(), line)
 
     #
     # What the child says, record by record.
@@ -508,9 +682,13 @@ class Agent:
         code = self.proc.poll() if self.proc is not None else None
         self.gone = True
 
-        if self.targets:
-            self.tell(self.latest(), "the agent went away, status %s" % code)
+        dropped = self.drop_waiting()
 
+        if self.running is not None:
+            self.tell(self.running, "the agent went away, status %s%s"
+                % (code, dropped))
+
+        self.running = None
         self.busy = False
         self.typing(False)
         self.close()
@@ -530,7 +708,8 @@ class Agent:
         self.dispatch(rec)
 
     def expired(self, now):
-        return not self.busy and now - self.idle > self.opts.idle
+        return not self.busy and not self.unsent and \
+            now - self.idle > self.opts.idle
 
 
 class PiAgent(Agent):
@@ -540,6 +719,7 @@ class PiAgent(Agent):
 
     def __init__(self, chat, key, opts):
         self.dialog = None
+        self.dialogs = []
 
         super().__init__(chat, key, opts)
 
@@ -552,25 +732,59 @@ class PiAgent(Agent):
 
         return argv
 
-    def submit(self, msg, steer):
-        cmd = {"id": self.next_id(), "type": "prompt",
-            "message": self.prompt_of(msg)}
-
-        if steer:
-            cmd["streamingBehavior"] = "steer"
-
-        return self.ask(cmd, ("prompt", msg))
+    def submit(self, msg):
+        return self.ask({"id": self.next_id(), "type": "prompt",
+            "message": self.prompt_of(msg)}, ("prompt", msg))
 
     def status(self, msg):
         self.ask({"id": self.next_id(), "type": "get_state"}, ("state", msg))
 
+    def asking(self):
+        return self.open_dialog() is not None
+
+    def pull_stats(self):
+        """Ask pi, or go by what we know if it still owes us an answer."""
+
+        if self.stats_asked:
+            self.tell(self.running, self.stats_line(["pi is not answering"]))
+            return
+
+        self.stats_asked = True
+        self.ask({"id": self.next_id(), "type": "get_session_stats"},
+            ("stats", self.running))
+
+    def on_stats(self, msg, data):
+        self.stats_asked = False
+
+        if msg is not self.running:
+            return
+
+        details = []
+        context = data.get("contextUsage") or {}
+        tokens = data.get("tokens") or {}
+
+        if context.get("percent") is not None:
+            details.append("context %d%%" % context["percent"])
+
+        if tokens.get("total"):
+            details.append("%s tokens this session" % short(tokens["total"]))
+
+        if data.get("cost"):
+            details.append("$%.2f" % data["cost"])
+
+        self.tell(msg, self.stats_line(details))
+
     def abort(self, msg):
-        self.tell(msg, "stopping")
+        self.tell(msg, "stopping%s" % self.drop_waiting())
+        self.drop_dialogs()
         self.ask({"id": self.next_id(), "type": "abort"}, ("note", msg))
 
     def fresh(self, msg):
         self.wants.clear()
-        self.targets = []
+        self.running = None
+        self.waiting = []
+        self.dialog = None
+        self.dialogs = []
         self.busy = False
         self.typing(False)
         self.tell(msg, "a fresh session")
@@ -605,9 +819,20 @@ class PiAgent(Agent):
     def on_response(self, rec):
         want = self.wants.pop(rec.get("id"), None)
 
+        if want is not None and want[0] == "stats":
+            self.on_stats(want[1], rec.get("data") or {})
+            return
+
         if rec.get("success"):
+            data = rec.get("data") or {}
+
             if want is not None and want[0] == "state":
-                self.tell(want[1], self.state_text(rec.get("data") or {}))
+                self.tell(want[1], self.state_text(data))
+            elif want is not None and want[0] == "prompt" and \
+                data.get("disposition") == "handled" and \
+                want[1] is self.running:
+                self.finish()
+
             return
 
         error = rec.get("error") or "it said no"
@@ -616,20 +841,19 @@ class PiAgent(Agent):
             log("%s: %s failed: %s" % (self.key, rec.get("command"), error))
             return
 
-        if want[0] == "prompt":
-            self.busy = False
-            self.typing(False)
-
         self.tell(want[1], "the agent would not do that: %s" % error)
+
+        if want[0] == "prompt" and want[1] is self.running:
+            self.finish()
 
     def state_text(self, data):
         model = data.get("model") or {}
         count = data.get("messageCount", 0)
 
-        return "%s/%s, %s, %d message%s in it" % (model.get("provider", "?"),
+        return "%s/%s, %s, %d message%s in it%s" % (model.get("provider", "?"),
             model.get("id", "?"),
             "working" if data.get("isStreaming") else "idle",
-            count, "" if count == 1 else "s")
+            count, "" if count == 1 else "s", self.waiting_text())
 
     def on_message_end(self, rec):
         message = rec.get("message") or {}
@@ -637,25 +861,22 @@ class PiAgent(Agent):
         if message.get("role") != "assistant":
             return
 
-        text = agent_text(message)
-
-        if text:
-            self.answer = text
+        self.add_answer(agent_text(message))
 
     def settle(self, aborted):
-        self.busy = False
-        self.typing(False)
-
-        if not self.targets:
-            return
+        self.dialog = None
+        self.dialogs = []
 
         text = self.answer or ""
         self.answer = None
 
-        if aborted:
-            text = (text + "\n" if text else "") + "(aborted)"
+        if self.running is not None:
+            if aborted:
+                text = (text + "\n" if text else "") + "(aborted)"
 
-        self.deliver(text)
+            self.deliver(text)
+
+        self.finish()
 
     def on_dialog(self, rec):
         """
@@ -668,12 +889,12 @@ class PiAgent(Agent):
 
         if method not in DIALOGS:
             if method == "notify":
-                self.tell(self.latest(), rec.get("message") or "")
+                self.tell(self.owner(), rec.get("message") or "")
             return
 
         options = [str(option) for option in rec.get("options") or []]
-        self.dialog = {"id": rec.get("id"), "method": method,
-            "options": options}
+        who = self.owner()
+        timeout = rec.get("timeout")
 
         question = rec.get("title") or "the agent wants an answer"
 
@@ -687,17 +908,71 @@ class PiAgent(Agent):
         else:
             question = "%s (an answer, or anything else to drop it)" % question
 
-        self.tell(self.latest(), question)
+        self.dialogs.append({"id": rec.get("id"), "method": method,
+            "options": options, "question": question,
+            "from": who.author if who is not None else None,
+            "until": time.monotonic() + timeout / 1000 if timeout else None})
+        self.next_dialog()
+
+    def open_dialog(self):
+        """The dialog being asked, unless pi has given up on it by itself."""
+
+        want = self.dialog
+
+        if want is None or want["until"] is None or \
+            time.monotonic() < want["until"]:
+            return want
+
+        return None
+
+    def next_dialog(self):
+        """Put one question to the chat at a time, the oldest first."""
+
+        if self.open_dialog() is not None:
+            return
+
+        self.dialog = None
+
+        while self.dialogs and self.dialog is None:
+            self.dialog = self.dialogs.pop(0)
+
+            if self.open_dialog() is None:
+                self.dialog = None
+
+        if self.dialog is not None:
+            self.tell(self.owner(), self.dialog["question"])
+
+    def drop_dialogs(self):
+        """Tell pi nobody will answer, it stays blocked on them otherwise."""
+
+        for want in [self.open_dialog()] + self.dialogs:
+            if want is not None:
+                self.ask({"type": "extension_ui_response", "id": want["id"],
+                    "cancelled": True})
+
+        self.dialog = None
+        self.dialogs = []
+
+    def awaits(self, msg):
+        want = self.open_dialog()
+
+        return want is not None and msg.author == want["from"]
 
     def answered(self, msg):
         """Whether what a peer just typed replies to a pending dialog."""
 
         text = msg.text
-        want, self.dialog = self.dialog, None
+        want = self.open_dialog()
 
         if want is None:
+            self.next_dialog()
             return False
 
+        if want["from"] is not None and msg.author != want["from"]:
+            self.tell(msg, "only %02x can answer that" % want["from"])
+            return True
+
+        self.dialog = None
         reply = None
 
         if want["method"] in ("input", "editor"):
@@ -716,11 +991,13 @@ class PiAgent(Agent):
         if reply is None:
             self.ask({"type": "extension_ui_response", "id": want["id"],
                 "cancelled": True})
+            self.next_dialog()
             return False
 
         response = {"type": "extension_ui_response", "id": want["id"]}
         response.update(reply)
         self.ask(response)
+        self.next_dialog()
 
         return True
 
@@ -745,6 +1022,7 @@ class ClaudeAgent(Agent):
         self.asks = []
         self.asked = None
         self.trusted = set()
+        self.usages = {}
 
         super().__init__(chat, key, opts)
 
@@ -811,7 +1089,35 @@ class ClaudeAgent(Agent):
     # What the chat asks of it.
     #
 
-    def submit(self, msg, steer):
+    def begin(self, msg):
+        self.usages = {}
+
+        super().begin(msg)
+
+    def asking(self):
+        return self.asked is not None
+
+    def pull_stats(self):
+        """
+        There is nothing to ask a headless Claude Code for, so this adds up
+        the usage on the messages it sent during this turn.
+        """
+
+        details = []
+
+        if self.usages:
+            last = list(self.usages.values())[-1]
+            context = sum(last.get(name) or 0 for name in ("input_tokens",
+                "cache_read_input_tokens", "cache_creation_input_tokens"))
+            written = sum(usage.get("output_tokens") or 0
+                for usage in self.usages.values())
+
+            details.append("context %s tokens" % short(context))
+            details.append("%s written" % short(written))
+
+        self.tell(self.running, self.stats_line(details))
+
+    def submit(self, msg):
         return self.ask({"type": "user", "message": {"role": "user",
             "content": self.prompt_of(msg)}})
 
@@ -839,16 +1145,16 @@ class ClaudeAgent(Agent):
             trust = ", allowing everything from %s" % ", ".join(
                 "%02x" % id for id in sorted(self.trusted))
 
-        self.tell(msg, "claude/%s, %s, %d turn%s in it%s" % (
+        self.tell(msg, "claude/%s, %s, %d turn%s in it%s%s" % (
             self.model or "?", state, self.turns,
-            "" if self.turns == 1 else "s", trust))
+            "" if self.turns == 1 else "s", self.waiting_text(), trust))
 
     def abort(self, msg):
         if not self.busy:
             self.tell(msg, "there is nothing to stop")
             return
 
-        self.tell(msg, "stopping")
+        self.tell(msg, "stopping%s" % self.drop_waiting())
         self.aborting = True
         self.control("interrupt", ("note", msg))
 
@@ -856,7 +1162,8 @@ class ClaudeAgent(Agent):
         self.close()
         self.remember(None)
         self.wants.clear()
-        self.targets = []
+        self.running = None
+        self.waiting = []
         self.asks = []
         self.asked = None
         self.trusted = set()
@@ -926,7 +1233,8 @@ class ClaudeAgent(Agent):
         return "allow %s?\n%s\nyes, no or yes to all" % (tool, body)
 
     def ask_next(self):
-        author = self.last.author if self.last else None
+        who = self.owner()
+        author = who.author if who is not None else None
 
         while self.asked is None and self.asks:
             ask = self.asks.pop(0)
@@ -939,7 +1247,7 @@ class ClaudeAgent(Agent):
             self.asked = ask
             self.asked["from"] = author
             self.typing(False)
-            self.tell(self.last, self.question(ask["request"]))
+            self.tell(who, self.question(ask["request"]))
 
     def allow(self, ask):
         self.respond(ask["id"], {"behavior": "allow",
@@ -1022,10 +1330,12 @@ class ClaudeAgent(Agent):
             return
 
         message = rec.get("message") or {}
-        text = agent_text(message)
 
-        if text:
-            self.answer = text
+        # One message can arrive as a record per block, all with its usage.
+        if message.get("usage"):
+            self.usages[message.get("id")] = message["usage"]
+
+        self.add_answer(agent_text(message))
 
         for block in message.get("content") or []:
             if isinstance(block, dict) and block.get("type") == "tool_use":
@@ -1038,12 +1348,17 @@ class ClaudeAgent(Agent):
         aborted, self.aborting = self.aborting, False
 
         self.turns += 1
-        self.busy = False
         self.asks = []
         self.asked = None
-        self.typing(False)
 
-        text = rec.get("result") or self.answer or ""
+        # The result repeats the last assistant message, or says why there
+        # was none.
+        result = (rec.get("result") or "").strip()
+
+        if not (self.answer or "").endswith(result):
+            self.add_answer(result)
+
+        text = self.answer or ""
         self.answer = None
 
         if aborted:
@@ -1052,13 +1367,10 @@ class ClaudeAgent(Agent):
             why = "; ".join(rec.get("errors") or []) or rec.get("subtype")
             text = (text + "\n" if text else "") + "it failed: %s" % why
 
-        if not self.targets:
-            if not text or self.last is None:
-                return
+        if self.running is not None or (text and self.last is not None):
+            self.deliver(text)
 
-            self.targets.append(self.last)
-
-        self.deliver(text)
+        self.finish()
 
     def on_control(self, rec):
         request = rec.get("request") or {}
@@ -1081,7 +1393,7 @@ class ClaudeAgent(Agent):
             self.asked = None
 
             if not self.aborting:
-                self.tell(self.last, "that question no longer applies")
+                self.tell(self.owner(), "that question no longer applies")
 
             self.ask_next()
 
@@ -1110,7 +1422,7 @@ class ClaudeAgent(Agent):
         log("%s: no session %s to resume, starting a new one" % (self.key,
             self.session_id))
 
-        msg = self.latest()
+        msg = self.running
 
         self.remember(None)
         self.close()
@@ -1118,7 +1430,7 @@ class ClaudeAgent(Agent):
         self.start()
 
         if msg is not None and self.proc is not None:
-            self.submit(msg, False)
+            self.submit(msg)
 
 
 AGENTS = {"pi": PiAgent, "claude": ClaudeAgent}
@@ -1267,6 +1579,15 @@ class AgentChat(pygospel.GospelChat):
             agent.command(msg, head, rest.strip())
         else:
             agent.feed(msg)
+
+    def on_avatar(self, peer):
+        """A peer's picture came or went; we keep no UI to show it in."""
+
+        if peer.avatar is None:
+            log("%s took its picture away" % ("%02x" % peer.id,))
+        else:
+            log("%s sent a picture of itself of %d bytes" % ("%02x" % peer.id,
+                len(peer.avatar)))
 
     def on_data(self, msg):
         """A voice message becomes a prompt, anything else a file to read."""
@@ -1460,6 +1781,9 @@ class AgentChat(pygospel.GospelChat):
         for key in list(self.agents):
             agent = self.agents[key]
 
+            agent.flush(now)
+            agent.check_stats(now)
+
             if agent.gone or agent.expired(now):
                 agent.close()
                 del self.agents[key]
@@ -1527,12 +1851,19 @@ def main():
     ap.add_argument("--transcribe",
         help="a command that prints the words of the audio file it is given "
         "as its last argument, see tools/transcribe.py")
+    ap.add_argument("--avatar",
+        help="a picture to show peers for this device, a PNG, JPEG, GIF or "
+        "WebP of at most 32 KiB")
+    ap.add_argument("--stats", type=int, default=60,
+        help="seconds between lines saying how a running job is doing, at "
+        "least 10, 0 for none")
     ap.add_argument("--progress", action="store_true",
         help="say which tools the agent runs while it works")
 
     args = ap.parse_args()
     args.dir = os.path.abspath(args.dir)
     args.idle = max(30, args.idle * 60)
+    args.stats = max(10, args.stats) if args.stats > 0 else 0
     state = os.path.join(os.environ.get("XDG_STATE_HOME") or
         os.path.expanduser("~/.local/state"), "vigil-python")
     args.sessions = os.path.join(state, "claude-sessions.json")
@@ -1552,6 +1883,9 @@ def main():
             config._validate()
 
         chat = AgentChat(config, args.nickname, args)
+
+        if args.avatar:
+            chat.set_avatar(args.avatar)
     except ValueError:
         sys.exit("--liturgy wants a group in hex, not %s" % args.liturgy)
     except (pygospel.GospelError, OSError) as e:

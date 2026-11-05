@@ -150,8 +150,10 @@ def test_heartbeat():
     check("heartbeat typing", hb[35:36], b"\x00")
     check("heartbeat features", hb[36:37], b"\x00")
 
-    uid, nick, typing, features, _, _ = pygospel.heartbeat_unpack(hb[11:])
+    uid, nick, typing, features, _, _, have = \
+        pygospel.heartbeat_unpack(hb[11:])
 
+    check("unpack have", have, 0)
     check("unpack uid", uid, b"\x01\x02\x03\x04\x05\x06\x07\x08")
     check("unpack nick", nick, b"bob".ljust(16, b"\x00"))
     check("unpack typing", typing, False)
@@ -703,6 +705,158 @@ def test_reply_waits_for_heartbeat():
 
     check("one arrived", len(one.got), 1)
     check("with its quote", one.got[0].quote.hash, 0x1234)
+
+    one.close()
+    two.close()
+
+
+def answer_pair(**kwargs):
+    """A sender and a peer, online, and what the peer has been told so far."""
+
+    fresh()
+
+    got = []
+    one = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        features=pygospel.FEATURE_REPLY, **kwargs)
+    two = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        features=pygospel.FEATURE_REPLY, **kwargs)
+
+    two.on_message = lambda msg: got.append(msg.text)
+
+    return one, two, got
+
+
+def test_answer_stays_in_order_past_a_waiting_reply():
+    one, two, got = answer_pair(signal_all=True)
+
+    pump([one, two], rounds=10)
+
+    one.peer(0x02).signal_tunnel.close()
+
+    one.reply(0x02, "first", pygospel.Quote(0x02, 0x1234))
+    one.send(0x02, "second")
+    one.send(0x02, "third")
+
+    pump([one, two], rounds=30)
+
+    check("in the order they were written", got, ["first", "second", "third"])
+    check("nothing held", one.outbox(0x02), [])
+
+    one.close()
+    two.close()
+
+
+def test_answer_stays_in_order_past_a_long_job():
+    one, two, got = answer_pair()
+    prompts = []
+
+    one.on_message = lambda msg: prompts.append(msg)
+
+    two.send(0x01, "make me a list")
+    pump([one, two], rounds=20)
+
+    check("the prompt arrived", len(prompts), 1)
+
+    pump([one, two], rounds=pygospel.TUNNEL_IDLE // 1000 * 2)
+
+    check("the tunnel went idle", one.peer(0x02).signal_tunnel, None)
+
+    one.reply(0x02, "first", prompts[0])
+    one.send(0x02, "second")
+    one.send(0x02, "third")
+
+    pump([one, two], rounds=40)
+
+    check("in the order they were written", got, ["first", "second", "third"])
+
+    one.close()
+    two.close()
+
+
+def test_answer_stays_in_order_past_a_lost_frame():
+    one, two, got = answer_pair(signal_all=True)
+
+    pump([one, two], rounds=10)
+
+    tunnel = one.peer(0x02).signal_tunnel
+    send_frame = tunnel.send_frame
+    lost = []
+
+    def lossy(data):
+        if not lost and pygospel.frame_unpack(data)[2] == pygospel.TYPE_TEXT:
+            lost.append(data)
+            return True
+
+        return send_frame(data)
+
+    tunnel.send_frame = lossy
+
+    one.send(0x02, "first")
+    one.send(0x02, "second")
+    one.send(0x02, "third")
+
+    pump([one, two], rounds=4)
+
+    check("one was lost", len(lost), 1)
+    check("nothing went past it", got, [])
+
+    pump([one, two], rounds=pygospel.RESEND_INTERVAL // 1000 + 4)
+
+    check("in the order they were written", got, ["first", "second", "third"])
+
+    one.close()
+    two.close()
+
+
+def test_group_answer_stays_in_order():
+    one, two, got = answer_pair(group=0x0007)
+
+    pump([one, two], rounds=10)
+
+    tunnel = one.peer(0x02).group_tunnel
+    tunnel.heard = False
+
+    one.reply_group("first", pygospel.Quote(0x02, 0x1234))
+    one.send_group("second")
+
+    pump([one, two], rounds=30)
+
+    check("in the order they were written", got, ["first", "second"])
+
+    one.close()
+    two.close()
+
+
+def test_group_message_waits_for_a_tunnel_that_is_down():
+    one, two, got = answer_pair(group=0x0007)
+
+    pump([one, two], rounds=10)
+
+    tunnel = one.peer(0x02).group_tunnel
+    tunnel.last_rx = pygospel._ms() - pygospel.RX_TIMEOUT - 1
+
+    ok("down", not tunnel.alive)
+
+    one.send_group("for when it is back")
+
+    pump([one, two], rounds=20)
+
+    check("it got there", got, ["for when it is back"])
+
+    one.close()
+    two.close()
+
+
+def test_reply_held_back_has_a_sensible_time():
+    one, two, got = answer_pair(signal_all=True)
+
+    pump([one, two], rounds=10)
+
+    one.peer(0x02).signal_tunnel.heard = False
+
+    msg = one.reply(0x02, "first", pygospel.Quote(0x02, 0x1234))
+
+    ok("written just now", abs(msg.ts - pygospel.time.time()) < 5)
 
     one.close()
     two.close()
@@ -1903,6 +2057,403 @@ def test_image_checks():
     a.close()
 
 
+def avatar_pair():
+    """Two chats that take data, online and holding nothing."""
+
+    fresh()
+
+    a = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True, take_data=True)
+    b = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True, take_data=True)
+
+    pump([a, b], rounds=8)
+
+    return a, b
+
+
+def test_avatar_on_the_wire():
+    a, b, takes = image_pair()
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=20, ms=50)
+
+    head = pygospel.DATA_HEAD.unpack_from(takes.blob, 0)
+
+    check("kind", head[0], pygospel.DATA_AVATAR)
+    check("name", head[2][:head[1]], b"avatar")
+    check("the bytes", takes.blob[pygospel.DATA_HEAD.size:], PNG)
+    check("announced", a.features & pygospel.FEATURE_AVATAR,
+        pygospel.FEATURE_AVATAR)
+    check("no message held", a.outbox(0x02), [])
+    check("nothing in flight", a.peer(0x02).signal_tunnel.xfer, None)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_arrives():
+    a, b = avatar_pair()
+    seen = []
+
+    b.on_avatar = lambda peer: seen.append((peer.id, peer.avatar))
+    b.on_data = lambda msg: seen.append(("data", msg.media))
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=20, ms=50)
+
+    check("it arrived", b.peer(0x01).avatar, PNG)
+    check("once, as an avatar", seen, [(0x01, PNG)])
+    check("no outbox", a.outbox(0x02), [])
+
+    a.close()
+    b.close()
+
+
+def test_avatar_goes_to_a_group():
+    fresh()
+
+    a = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        group=0x0007)
+    b = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        group=0x0007, take_data=True)
+
+    pump([a, b], rounds=10)
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=30, ms=100)
+
+    check("the member has it", b.peer(0x01).avatar, PNG)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_follows_a_change():
+    a, b = avatar_pair()
+    other = PNG + bytes(64)
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=20, ms=50)
+
+    a.set_avatar(other)
+    pump([a, b], rounds=20, ms=50)
+
+    check("the new one arrived", b.peer(0x01).avatar, other)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_taken_away():
+    a, b = avatar_pair()
+    seen = []
+
+    b.on_avatar = lambda peer: seen.append(peer.avatar)
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=20, ms=50)
+
+    a.set_avatar(None)
+    pump([a, b], rounds=6, ms=3000)
+
+    check("the bit is off", a.features & pygospel.FEATURE_AVATAR, 0)
+    check("ours is gone", a.avatar, None)
+    check("theirs is gone", b.peer(0x01).avatar, None)
+    check("said once each", seen, [PNG, None])
+
+    a.close()
+    b.close()
+
+
+def test_avatar_starts_on_a_new_tunnel():
+    fresh()
+
+    a = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True)
+
+    a.set_avatar(PNG)
+
+    b = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True, take_data=True)
+
+    pump([a, b], rounds=25, ms=200)
+
+    check("it arrived", b.peer(0x01).avatar, PNG)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_waits_for_data():
+    fresh()
+
+    a = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True)
+    b = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True)
+    heard = []
+
+    b.on_message = lambda msg: heard.append(msg.text)
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=10)
+
+    tunnel = a.peer(0x02).signal_tunnel
+
+    check("nothing queued", tunnel.avatar, None)
+    check("nothing in flight", tunnel.xfer, None)
+    check("no notice text either", heard, [])
+
+    a.close()
+    b.close()
+
+
+def test_avatar_alongside_an_image():
+    a, b = avatar_pair()
+    sent = []
+
+    a.on_sent = lambda ref, msg: sent.append(ref)
+    a.set_avatar(PNG)
+    msg = a.send_image(0x02, PNG, ref=9)
+    pump([a, b], rounds=40, ms=50)
+
+    check("the image was held", len(a.outbox(0x02)), 0)
+    check("sent once, for the image", sent, [9])
+    check("both arrived", b.peer(0x01).avatar, PNG)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_have_on_the_wire():
+    hb = pygospel.heartbeat_pack(b"\x01" * 8, "bob", False, 0, b"", b"",
+        0x1122334455667788)
+
+    off = 11 + 8 + 16 + 1 + 1 + 64 + 64
+
+    check("where it goes", hb[off:off + 8],
+        b"\x11\x22\x33\x44\x55\x66\x77\x88")
+    check("what comes back", pygospel.heartbeat_unpack(hb[11:])[6],
+        0x1122334455667788)
+    check("the hash of Vigil", pygospel._fnv1a(b"a"), 0xaf63dc4c8601ec8c)
+
+
+def avatar_held_pair():
+    """Two chats where b holds the avatar of a, and a heard that it does."""
+
+    a, b = avatar_pair()
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=20, ms=50)
+
+    check("it arrived", b.peer(0x01).avatar, PNG)
+
+    b.peer(0x01).signal_tunnel.next_heartbeat = 0
+    pump([a, b], rounds=4, ms=50)
+
+    check("a heard", a.peer(0x02).signal_tunnel.avatar_have,
+        pygospel._avatar_hash(PNG))
+
+    return a, b
+
+
+def test_avatar_not_sent_again_to_a_peer_holding_it():
+    a, b = avatar_held_pair()
+    seen = []
+
+    b.on_avatar = lambda peer: seen.append(peer.avatar)
+
+    tunnel = a.peer(0x02).signal_tunnel
+    tunnel.avatar_serial = 0
+    pump([a, b], rounds=20, ms=50)
+
+    check("nothing queued", tunnel.avatar, None)
+    check("nothing arrived", seen, [])
+    check("not asked again", tunnel.avatar_serial, a.avatar_serial)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_change_goes_to_a_peer_holding_the_old_one():
+    a, b = avatar_held_pair()
+    other = PNG + b"\x00"
+
+    a.set_avatar(other)
+    pump([a, b], rounds=20, ms=50)
+
+    check("the new one", b.peer(0x01).avatar, other)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_sent_again_when_peer_says_it_lost_it():
+    a, b = avatar_held_pair()
+    seen = []
+
+    b.on_avatar = lambda peer: seen.append(peer.avatar)
+
+    tunnel = a.peer(0x02).signal_tunnel
+    tunnel.on_frame(pygospel.heartbeat_pack(tunnel.remote_uid, "bob", False,
+        pygospel.FEATURE_DATA))
+    pump([a, b], rounds=20, ms=50)
+
+    check("sent again", seen, [PNG])
+
+    a.close()
+    b.close()
+
+
+def test_avatar_taken_away_stops_saying_we_hold_it():
+    a, b = avatar_held_pair()
+
+    a.set_avatar(None)
+    a.peer(0x02).signal_tunnel.next_heartbeat = 0
+    pump([a, b], rounds=4, ms=50)
+
+    check("dropped", b.peer(0x01).avatar, None)
+    check("says so", b.peer(0x01).avatar_held, 0)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_goes_after_waiting_data():
+    a, b = avatar_pair()
+    order = []
+
+    b.on_data = lambda msg: order.append("image")
+    b.on_avatar = lambda peer: order.append("avatar")
+
+    a.set_avatar(PNG)
+    a.send_image(0x02, PNG, ref=9)
+    pump([a, b], rounds=40, ms=50)
+
+    check("the image first", order, ["image", "avatar"])
+
+    a.close()
+    b.close()
+
+
+def test_image_with_ref_zero_is_sent():
+    a, b = avatar_pair()
+    sent = []
+
+    a.on_sent = lambda ref, msg: sent.append(ref)
+    a.send_image(0x02, PNG, ref=0)
+    pump([a, b], rounds=40, ms=50)
+
+    check("said so", sent, [0])
+
+    a.close()
+    b.close()
+
+
+def test_avatar_takes_one_seen_slot():
+    a, b = avatar_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+    before = tunnel.seen_next
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=20, ms=50)
+
+    check("it arrived", b.peer(0x01).avatar, PNG)
+    check("one slot", tunnel.seen_next - before, 1)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_repushed_when_peer_restarts():
+    a, b = avatar_pair()
+
+    a.set_avatar(PNG)
+    pump([a, b], rounds=20, ms=50)
+
+    check("it arrived", b.peer(0x01).avatar, PNG)
+
+    # Our peer came back up with new ids and nothing of what it had.
+    b.peer(0x01).avatar = None
+    btun = b.peer(0x01).signal_tunnel
+    btun.local_uid = os.urandom(8)
+    btun.next_heartbeat = 0
+
+    pump([a, b], rounds=20, ms=50)
+
+    check("it came again", b.peer(0x01).avatar, PNG)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_checks():
+    fresh()
+
+    a = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False)
+
+    boom("not an image", lambda: a.set_avatar(b"hello there"))
+    boom("too large", lambda: a.set_avatar(
+        PNG + bytes([0] * pygospel.AVATAR_MAX)))
+    boom("neither bytes nor a path", lambda: a.set_avatar(1.5))
+
+    check("nothing announced", a.features & pygospel.FEATURE_AVATAR, 0)
+    check("nothing to send", a.avatar, None)
+
+    a.set_avatar(b"")
+    check("empty bytes take it away", a.avatar, None)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "face.png")
+
+        with open(path, "wb") as f:
+            f.write(PNG)
+
+        a.set_avatar(path)
+        check("from a file", a.avatar, PNG)
+
+    a.close()
+
+
+def test_avatar_is_no_activity():
+    a, b = avatar_pair()
+
+    b.peer(0x01).active = 0
+    a.set_avatar(PNG)
+    pump([a, b], rounds=20, ms=50)
+
+    check("it arrived", b.peer(0x01).avatar, PNG)
+
+    a.close()
+    b.close()
+
+
+def test_avatar_too_large_is_dropped():
+    a, b = avatar_pair()
+    tunnel = b.peer(0x01).signal_tunnel
+    frames = []
+    seen = []
+    whole = blob(pygospel.DATA_AVATAR, "avatar",
+        bytes([0] * (pygospel.AVATAR_MAX + 1)))
+
+    tunnel.send_frame = lambda frame: frames.append(frame)
+    b.on_avatar = lambda peer: seen.append(peer.avatar)
+
+    for one in chunks(70, whole):
+        tunnel.on_frame(one)
+
+    types = [pygospel.frame_unpack(f)[2] for f in frames
+        if len(f) == pygospel.FRAME_SIZE]
+
+    ok("acked", pygospel.TYPE_ACK in types)
+    check("nothing kept", b.peer(0x01).avatar, None)
+    check("nothing said", seen, [])
+
+    a.close()
+    b.close()
+
+
 def test_group_image():
     fresh()
 
@@ -2048,7 +2599,7 @@ def test_data_dropped_but_acked():
 
     tunnel.send_frame = lambda frame: frames.append(frame)
 
-    for msgid, whole in ((60, blob(pygospel.DATA_AVATAR, "avatar", b"pic")),
+    for msgid, whole in ((60, blob(0, "avatar", b"data")),
         (61, blob(77, "x", b"data")), (62, blob(1, "../evil", b"data")),
         (63, blob(1, ".hidden", b"data")), (64, blob(1, "a\\b", b"data")),
         (65, blob(1, "", b"data")),

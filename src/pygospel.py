@@ -121,6 +121,7 @@ HEARTBEAT_ID   = b"\xff" * 8
 HEARTBEAT_UID  = 8
 HEARTBEAT_BODY = struct.Struct("!16sBB")
 HEARTBEAT_MIN  = HEARTBEAT_UID + HEARTBEAT_BODY.size
+HEARTBEAT_HAVE = struct.Struct("!Q")
 
 # A reply carries who wrote the message it answers and that message's hash.
 REPLY_HEAD = struct.Struct("!BQ")
@@ -133,6 +134,7 @@ DATA_FILE     = 2
 DATA_VOICE    = 3
 DATA_AVATAR   = 4
 DATA_KINDS    = {DATA_IMAGE: "image", DATA_FILE: "file", DATA_VOICE: "voice"}
+AVATAR_NAME   = b"avatar"
 DATA_NAME_MAX = 126
 DATA_MAX      = 4096 * 1024
 DATA_HEAD     = struct.Struct("!BB%ds" % DATA_NAME_MAX)
@@ -248,6 +250,12 @@ def _fnv1a(data):
         hash = (hash * 0x100000001b3) & 0xffffffffffffffff
 
     return hash
+
+
+def _avatar_hash(data):
+    """The hash of an avatar in a heartbeat, 0 means none."""
+
+    return _fnv1a(data) or 1
 
 
 def _quote_hash(data):
@@ -480,13 +488,14 @@ def frame_unpack(buf):
 
 
 def heartbeat_pack(uid, nickname, typing, features=FEATURES,
-    instance=b"", signature=b""):
+    instance=b"", signature=b"", avatar_have=0):
     """Build a heartbeat frame, which carries no length of its own."""
 
     nick = nickname.encode("utf-8")[:NICK_MAX].ljust(NICK_MAX, b"\x00")
     body = uid + HEARTBEAT_BODY.pack(nick, 1 if typing else 0, features)
     body += instance.ljust(INSTANCE_MAX, b"\x00")
     body += signature.ljust(SIGNATURE_LEN, b"\x00")
+    body += HEARTBEAT_HAVE.pack(avatar_have)
 
     return frame_pack(HEARTBEAT_ID, TYPE_HEARTBEAT, body, 0)
 
@@ -497,14 +506,19 @@ def heartbeat_unpack(payload):
     uid = payload[:HEARTBEAT_UID]
     nick, typing, features = HEARTBEAT_BODY.unpack_from(payload, HEARTBEAT_UID)
     instance = signature = b""
+    avatar_have = 0
+    off = HEARTBEAT_MIN
 
-    if len(payload) >= HEARTBEAT_MIN + INSTANCE_MAX + SIGNATURE_LEN:
-        off = HEARTBEAT_MIN
+    if len(payload) >= off + INSTANCE_MAX + SIGNATURE_LEN:
         instance = payload[off:off + INSTANCE_MAX]
-        signature = payload[off + INSTANCE_MAX:off + INSTANCE_MAX +
-            SIGNATURE_LEN]
+        off += INSTANCE_MAX
+        signature = payload[off:off + SIGNATURE_LEN]
+        off += SIGNATURE_LEN
 
-    return uid, nick, bool(typing), features, instance, signature
+        if len(payload) >= off + HEARTBEAT_HAVE.size:
+            avatar_have = HEARTBEAT_HAVE.unpack_from(payload, off)[0]
+
+    return uid, nick, bool(typing), features, instance, signature, avatar_have
 
 
 class GospelConfig:
@@ -790,6 +804,8 @@ class Peer:
         typing    it said it is typing
         opened    you marked its chat open, so we keep signaling it
         link      how we reach it: none, connecting, relay or p2p
+        avatar    the bytes it last sent us as its picture, None if it has
+                  none or has taken it away
     """
 
     def __init__(self, chat, id):
@@ -808,7 +824,17 @@ class Peer:
         self.outbox = []
         self.signal_tunnel = None
         self.group_tunnel = None
+        self.avatar = None
         self._chat = chat
+
+    @property
+    def avatar(self):
+        return self._avatar
+
+    @avatar.setter
+    def avatar(self, data):
+        self._avatar = data
+        self.avatar_held = 0 if data is None else _avatar_hash(data)
 
     @property
     def best_name(self):
@@ -1157,6 +1183,9 @@ class _Tunnel:
         self.waitq = []
         self.xfer = None
         self.rxfer = None
+        self.avatar = None
+        self.avatar_serial = 0
+        self.avatar_have = 0
         self.seen = [_Seen() for _ in range(SEEN_MAX)]
         self.seen_next = 0
 
@@ -1225,14 +1254,8 @@ class _Tunnel:
             held.age = _ms()
             return
 
-        # Replies wait until we know if our peer takes them, see _resend().
-        if held.quote is not None and held.quote.hash != 0 and not self.heard:
-            held.age = 0
-            return
-
-        held.pending = True
-        held.age = _ms()
-        self.sendq.append(held)
+        # Due right away, _resend() decides when its turn has come.
+        held.age = 0
 
     def send_frame(self, data):
         shroud = libkyrka.KYRKA_PACKET_SHROUD_CATHEDRAL if self.relay \
@@ -1249,7 +1272,8 @@ class _Tunnel:
 
         return self.send_frame(heartbeat_pack(self.local_uid,
             self.chat.nickname, self.typing_sent, self.chat.features,
-            self.chat.name_instance, self.chat.name_proof))
+            self.chat.name_instance, self.chat.name_proof,
+            self.peer.avatar_held))
 
     def send_ack(self, msgid):
         return self.send_frame(frame_pack(msgid, TYPE_ACK))
@@ -1294,6 +1318,7 @@ class _Tunnel:
             return
 
         self._resend(now)
+        self._avatar_push()
         self._xfer_run(now)
         self._rxfer_check(now)
 
@@ -1317,18 +1342,89 @@ class _Tunnel:
                         self.chat._message_of(held, self.peer.id, None))
 
     def _resend(self, now):
-        """Queue again whatever we sent and never heard anything about."""
+        """
+        Queue the oldest text our peer has not acked, once it is due. Only
+        that one: a frame carries nothing a peer could put messages back in
+        order with, so whatever overtakes a lost message or a reply waiting
+        on a heartbeat is shown ahead of it for good.
+        """
 
-        for held in list(self._held()):
-            if held.pending or held.msgid == 0 or held.blob is not None:
-                continue
-            if now - held.age < RESEND_INTERVAL:
-                continue
-            if held.quote is not None and not self.heard:
+        for held in self._held():
+            if held.msgid == 0 or held.blob is not None:
                 continue
 
-            held.pending = True
-            self.sendq.append(held)
+            # Replies wait until we know if our peer takes them.
+            if not held.pending and now - held.age >= RESEND_INTERVAL and \
+                (not held.quote or self.heard):
+                held.pending = True
+                self.sendq.append(held)
+
+            return
+
+    def _avatar_push(self):
+        """
+        Send our avatar once we know our peer takes data, and again whenever
+        ours changes. It is not a message: it holds no place in an outbox,
+        goes after any data waiting there, and a peer that takes no data
+        never sees it.
+        """
+
+        if not self.online or not self.heard:
+            return
+
+        if not self.features & FEATURE_DATA:
+            return
+
+        if self.avatar_serial == self.chat.avatar_serial:
+            return
+
+        self.avatar_serial = self.chat.avatar_serial
+        self._avatar_drop()
+
+        if self.chat._avatar is None:
+            return
+
+        if self.avatar_have == self.chat._avatar_hash:
+            return
+
+        held = _Held(0, "", None, self.chat._avatar, AVATAR_NAME.decode())
+        held.sent = True
+        self._queue(held)
+        self.avatar = held
+
+    def _avatar_drop(self):
+        """Stop sending the avatar we had queued, if we were."""
+
+        if self.avatar is None:
+            return
+
+        if self.xfer is not None and self.xfer.held is self.avatar:
+            self.xfer = None
+
+        self.avatar = None
+
+    def _avatar_arrived(self, data, msgid):
+        """
+        The picture a peer shows for itself. It goes to the peer record and
+        not to on_data, and it does not count as the peer being active.
+        """
+
+        if len(data) > AVATAR_MAX:
+            self.send_ack(msgid)
+            return
+
+        self.peer.avatar = data
+        self.send_ack(msgid)
+        self.chat._emit("on_avatar", self.peer)
+
+    def _avatar_check(self, features):
+        """A peer that stops announcing an avatar has taken it away."""
+
+        if features & FEATURE_AVATAR or self.peer.avatar is None:
+            return
+
+        self.peer.avatar = None
+        self.chat._emit("on_avatar", self.peer)
 
     def _xfer_run(self, now):
         """Start on the next blob if the peer takes them, then send chunks."""
@@ -1348,6 +1444,9 @@ class _Tunnel:
                 held.blob = None
                 held.pending = True
                 self.sendq.append(held)
+
+            if self.xfer is None and self.avatar is not None:
+                self.xfer = _Xfer(self.avatar, now)
 
             if self.xfer is None:
                 return
@@ -1552,9 +1651,17 @@ class _Tunnel:
         slot = self._seen_slot(xfer.msgid, 0, None)
         slot.size = xfer.size
 
-        if kind not in DATA_KINDS or length > DATA_NAME_MAX or \
-            not _data_name_valid(name):
+        if kind != DATA_AVATAR and kind not in DATA_KINDS:
             self.send_ack(xfer.msgid)
+            return
+
+        if length > DATA_NAME_MAX or not _data_name_valid(name):
+            self.send_ack(xfer.msgid)
+            return
+
+        if kind == DATA_AVATAR:
+            self._avatar_arrived(bytes(xfer.data[DATA_HEAD.size:]),
+                xfer.msgid)
             return
 
         msg = Message("", peer=self.peer.id,
@@ -1618,7 +1725,7 @@ class _Tunnel:
         self.chat.rxfers -= 1
 
     def _on_heartbeat(self, payload):
-        uid, nick, typing, features, instance, signature = \
+        uid, nick, typing, features, instance, signature, have = \
             heartbeat_unpack(payload)
         name = nick.split(b"\x00", 1)[0]
 
@@ -1633,6 +1740,11 @@ class _Tunnel:
 
         self.heard = True
         self.features = features
+        self._avatar_check(features)
+
+        if self.avatar_have != have:
+            self.avatar_have = have
+            self.avatar_serial = 0
 
         if self.peer.typing != typing:
             self.peer.typing = typing
@@ -1649,6 +1761,10 @@ class _Tunnel:
                 slot.hash = 0
                 slot.token = 0
                 slot.msg = None
+
+            self._avatar_drop()
+            self.avatar_serial = 0
+            self._rxfer_free()
 
         self.remote_uid = uid
 
@@ -1721,6 +1837,13 @@ class _Tunnel:
             payload[REPLY_HEAD.size:], quote)
 
     def _on_ack(self, msgid):
+        if self.avatar is not None and self.avatar.msgid == msgid:
+            if self.xfer is not None and self.xfer.held is self.avatar:
+                self.xfer = None
+
+            self.avatar = None
+            return
+
         for held in list(self._held()):
             if held.msgid != msgid:
                 continue
@@ -1881,7 +2004,8 @@ class GospelChat:
                     signed-name bit if our own name verifies against the
                     flock key in the configuration
         take_data   receive images, files and voice messages through on_data
-                    and tell our peers we do. Avatars are acked and dropped.
+                    and tell our peers we do. Avatars arrive the same way,
+                    under peer.avatar and on_avatar rather than as data.
         discoverable
                     show up as a peer on Vigil devices using the same
                     `liturgy_group` as our configuration. Vigil also shows
@@ -1947,6 +2071,12 @@ class GospelChat:
 
         self.features = features
         self.rxfers = 0
+
+        # What we show ourselves as, ready for the wire, and the count that
+        # says which tunnels already have it.
+        self._avatar = None
+        self._avatar_hash = 0
+        self.avatar_serial = 0
 
         self.nickname = self._check_nick(nickname)
         self.group_typing = False
@@ -2036,8 +2166,9 @@ class GospelChat:
 
     def send_group(self, text, ref=None, quote=None):
         """
-        Send a text message to every member of our group that is online at
-        this moment. on_group_delivered follows as they ack it.
+        Send a text message to every member of our group we have a tunnel
+        with, one that is down gets it when it comes back. A member that left
+        by then does not. on_group_delivered follows as they ack it.
         """
 
         if self.group == 0:
@@ -2056,7 +2187,7 @@ class GospelChat:
 
             tunnel = target.group_tunnel
 
-            if tunnel is None or not tunnel.alive:
+            if tunnel is None:
                 continue
 
             held = _Held(tally.ref, text, quote)
@@ -2068,7 +2199,7 @@ class GospelChat:
             tunnel._queue(held)
 
         if tally.pending == 0:
-            raise GospelError("no member of the group is online")
+            raise GospelError("no member of the group to send to")
 
         self.tallies.append(tally)
 
@@ -2108,8 +2239,8 @@ class GospelChat:
 
     def send_group_image(self, image, name=None, ref=None):
         """
-        Send an image to every member of our group that is online at this
-        moment. on_group_delivered follows as they ack it.
+        Send an image to every member of our group we have a tunnel with,
+        like send_group(). on_group_delivered follows as they ack it.
         """
 
         if self.group == 0:
@@ -2126,7 +2257,7 @@ class GospelChat:
 
             tunnel = target.group_tunnel
 
-            if tunnel is None or not tunnel.alive:
+            if tunnel is None:
                 continue
 
             held = _Held(tally.ref, DATA_NOTICE, None, blob, name)
@@ -2138,7 +2269,7 @@ class GospelChat:
             tunnel._queue(held)
 
         if tally.pending == 0:
-            raise GospelError("no member of the group is online")
+            raise GospelError("no member of the group to send to")
 
         self.tallies.append(tally)
 
@@ -2148,6 +2279,63 @@ class GospelChat:
         msg._chat = self
 
         return msg
+
+    def set_avatar(self, image=None):
+        """
+        Show peers this picture as ours: a path, or the bytes of a PNG, JPEG,
+        GIF or WebP of at most 32 KiB. None, or empty bytes, takes ours away
+        and peers drop the one they hold.
+
+        An avatar is not a message: it holds no place in an outbox, gets no
+        on_sent or on_delivered, and goes only to the tunnels that take data.
+        """
+
+        blob = None
+
+        if image is not None:
+            if isinstance(image, (bytes, bytearray, memoryview)):
+                data = bytes(image)
+            else:
+                data = self._image_read(image, AVATAR_MAX)
+
+            if data:
+                if len(data) > AVATAR_MAX:
+                    raise GospelError("an avatar is at most %d bytes"
+                        % AVATAR_MAX)
+
+                if image_type(data) is None:
+                    raise GospelError("not a PNG, JPEG, GIF or WebP image")
+
+                blob = DATA_HEAD.pack(DATA_AVATAR, len(AVATAR_NAME),
+                    AVATAR_NAME) + data
+
+        if blob == self._avatar:
+            return
+
+        self._avatar = blob
+
+        if blob is None:
+            self._avatar_hash = 0
+            self.features &= ~FEATURE_AVATAR
+        else:
+            self._avatar_hash = _avatar_hash(data)
+            self.features |= FEATURE_AVATAR
+
+        self.avatar_serial += 1
+
+        for target in self.peers.values():
+            for tunnel in (target.signal_tunnel, target.group_tunnel):
+                if tunnel is not None:
+                    tunnel._avatar_push()
+
+    @property
+    def avatar(self):
+        """The bytes peers show for us, None if we show none."""
+
+        if self._avatar is None:
+            return None
+
+        return self._avatar[DATA_HEAD.size:]
 
     def join(self, group):
         """
@@ -2441,6 +2629,9 @@ class GospelChat:
         pass
 
     def on_data(self, msg):
+        pass
+
+    def on_avatar(self, peer):
         pass
 
     def on_sent(self, ref, msg):
@@ -2776,14 +2967,14 @@ class GospelChat:
         return DATA_HEAD.pack(DATA_IMAGE, len(raw), raw) + data, name
 
     @staticmethod
-    def _image_read(path):
+    def _image_read(path, limit=DATA_MAX):
         try:
             with open(path, "rb", opener=lambda p, flags: os.open(p,
                 flags | os.O_NONBLOCK)) as f:
                 if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
                     raise GospelError("%s is not a file" % path)
 
-                return f.read(DATA_MAX + 1)
+                return f.read(limit + 1)
         except (OSError, TypeError) as e:
             raise GospelError("cannot read the image: %s" % e)
 
@@ -2939,8 +3130,10 @@ class GospelChat:
         msg.id = held.msgid
         msg.delivered = held.delivered
         msg.name = held.name
-        msg.ts = time.time() - (_ms() - held.age) / 1000.0
         msg._chat = self
+
+        if held.age != 0:
+            msg.ts = time.time() - (_ms() - held.age) / 1000.0
 
         return msg
 
