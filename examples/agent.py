@@ -57,8 +57,10 @@ ASK_NO       = ("n", "no")
 ASK_ALL      = ("yes to all", "yes all")
 ASK_MAX      = 1500
 VOICE_MAX    = 300
+RENDER_MAX   = 600
 UNSENT_MAX   = 900
 IMAGE_LINE   = re.compile(r"^[ \t]*\[image:[ \t]*(.+?)[ \t]*\][ \t]*$", re.M)
+RENDER       = re.compile(r"^!render(?:\s+(.*))?$", re.I | re.S)
 
 # The session a child must not inherit: those describe whoever started this
 # program, not the run the child is having on its own.
@@ -72,6 +74,7 @@ CLAUDE_VARS = ("CLAUDECODE", "CLAUDE_PID", "CLAUDE_EFFORT",
 
 HELP = """\
   <text>          a job for the agent
+  !render <what>  draw an image, if started with --render
   /status         model, whether it is working, how long the session is
   /abort          stop what it is doing and drop what waits behind it
   /new            start a fresh session
@@ -1436,54 +1439,59 @@ class ClaudeAgent(Agent):
 AGENTS = {"pi": PiAgent, "claude": ClaudeAgent}
 
 
-class Transcriber:
+class Worker:
     """
-    Turns voice messages into text one at a time, with a child on the loop
-    of the chat. The audio only exists in a private folder while its child
-    runs.
+    Runs one job at a time as a child on the loop of the chat. What a job
+    works on only exists in a private folder while its child runs.
     """
+
+    NAME  = "worker"
+    LIMIT = 0
 
     def __init__(self, chat, argv):
         self.chat = chat
         self.argv = argv
         self.queue = []
-        self.msg = None
+        self.job = None
         self.proc = None
         self.fd = None
         self.buf = b""
         self.started = 0
         self.dir = None
 
-    def add(self, msg):
-        self.queue.append(msg)
+    def add(self, job):
+        self.queue.append(job)
         self.next()
+
+    def busy(self):
+        return self.job is not None
+
+    def private(self, name, data):
+        path = os.path.join(self.dir, name)
+
+        with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600), "wb") as f:
+            f.write(data)
+
+        return path
 
     def next(self):
         if self.proc is not None or not self.queue:
             return
 
-        self.msg = self.queue.pop(0)
+        self.job = self.queue.pop(0)
         self.buf = b""
         self.started = time.monotonic()
 
-        if self.dir is None:
-            self.dir = tempfile.mkdtemp(prefix="vigil-voice-")
-
-        path = os.path.join(self.dir, "voice")
-
         try:
-            with open(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
-                0o600), "wb") as f:
-                f.write(self.msg.data)
+            if self.dir is None:
+                self.dir = tempfile.mkdtemp(prefix="vigil-%s-" % self.NAME)
 
-            self.proc = subprocess.Popen(self.argv + [path],
-                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL)
+            self.proc = self.launch(self.job)
         except OSError as e:
             self.finish(None, str(e))
             return
 
-        self.msg.data = None
         self.fd = self.proc.stdout.fileno()
         os.set_blocking(self.fd, False)
         self.chat.add_reader(self.fd, self.on_output)
@@ -1506,16 +1514,20 @@ class Transcriber:
         self.proc = None
 
         if code != 0:
-            self.finish(None, "the transcriber exited with status %d" % code)
+            self.finish(None, "the %s exited with status %d" % (self.NAME,
+                code))
             return
 
         self.finish(self.buf.decode("utf-8", "replace").strip(), None)
 
     def finish(self, text, error):
-        msg, self.msg = self.msg, None
+        job, self.job = self.job, None
 
-        self.wipe()
-        self.chat.heard(msg, text, error)
+        try:
+            self.done(job, text, error)
+        finally:
+            self.wipe()
+
         self.next()
 
     def wipe(self):
@@ -1524,7 +1536,7 @@ class Transcriber:
             self.dir = None
 
     def check(self, now):
-        if self.proc is not None and now - self.started > VOICE_MAX:
+        if self.proc is not None and now - self.started > self.LIMIT:
             self.proc.kill()
 
     def close(self):
@@ -1538,6 +1550,67 @@ class Transcriber:
         self.wipe()
 
 
+class Transcriber(Worker):
+    """Turns voice messages into text."""
+
+    NAME  = "transcriber"
+    LIMIT = VOICE_MAX
+
+    def launch(self, msg):
+        path = self.private("voice", msg.data)
+        proc = subprocess.Popen(self.argv + [path],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+
+        msg.data = None
+
+        return proc
+
+    def done(self, msg, text, error):
+        self.chat.heard(msg, text, error)
+
+
+class Renderer(Worker):
+    """
+    Turns prompts into images. The prompt goes in on stdin, where it cannot
+    be taken for an option or read from the process list. Whatever the child
+    has to say about a failure goes to our log.
+    """
+
+    NAME  = "renderer"
+    LIMIT = RENDER_MAX
+
+    def launch(self, job):
+        msg, prompt = job
+        path = self.private("prompt", prompt.encode("utf-8"))
+
+        with open(path, "rb") as stdin:
+            proc = subprocess.Popen(self.argv + [self.image()], stdin=stdin,
+                stdout=subprocess.PIPE)
+
+        self.typing(msg, True)
+
+        return proc
+
+    def image(self):
+        return os.path.join(self.dir, "render.png")
+
+    def typing(self, msg, on):
+        try:
+            self.chat.typing(on, msg.peer if msg.group is None else None)
+        except pygospel.GospelError:
+            pass
+
+    def done(self, job, text, error):
+        msg, _ = job
+
+        if error is None and not os.path.isfile(self.image()):
+            error = "the renderer wrote no image"
+
+        self.typing(msg, False)
+        self.chat.rendered(msg, self.image(), error)
+
+
 class AgentChat(pygospel.GospelChat):
     """A gospel chat whose replies come from agent sessions."""
 
@@ -1547,9 +1620,13 @@ class AgentChat(pygospel.GospelChat):
         self.opts = opts
         self.agents = {}
         self.voices = None
+        self.renders = None
 
         if opts.transcribe:
             self.voices = Transcriber(self, shlex.split(opts.transcribe))
+
+        if opts.render:
+            self.renders = Renderer(self, shlex.split(opts.render))
 
         super().__init__(config, nickname=nickname, group=opts.group,
             signal_all=opts.signal_all, take_data=True,
@@ -1559,6 +1636,12 @@ class AgentChat(pygospel.GospelChat):
         text = msg.text.strip()
 
         if not text or not self.allowed(msg):
+            return
+
+        render = RENDER.match(text)
+
+        if render:
+            self.render(msg, render.group(1))
             return
 
         head, _, rest = text.partition(" ")
@@ -1629,6 +1712,46 @@ class AgentChat(pygospel.GospelChat):
 
         msg.text = "(voice message, transcribed) %s" % text
         self.on_message(msg)
+
+    def render(self, msg, prompt):
+        """A !render, which goes to the renderer and not to any agent."""
+
+        if self.renders is None:
+            self.say(msg, "I cannot draw, I was started without --render")
+            return
+
+        if not prompt:
+            self.say(msg, "say what to draw, like !render a cat on a roof")
+            return
+
+        log("%s wants an image of %r" % (msg.where, prompt))
+
+        if self.renders.busy():
+            self.say(msg, "drawing something else first, %d ahead of this"
+                % (len(self.renders.queue) + 1))
+
+        self.renders.add((msg, prompt))
+
+    def rendered(self, msg, path, error):
+        """Send what the renderer drew to wherever it was asked for."""
+
+        if msg.group is not None and msg.group != self.group:
+            log("%s: not sending an image, we left that group" % msg.where)
+            return
+
+        if error is not None:
+            log("%s: no image: %s" % (msg.where, error))
+            self.say(msg, "I could not draw that: %s" % error)
+            return
+
+        try:
+            if msg.group is None:
+                self.send_image(msg.peer, path)
+            else:
+                self.send_group_image(path)
+        except (pygospel.GospelError, OSError) as e:
+            log("%s: cannot send an image: %s" % (msg.where, e))
+            self.say(msg, "I could not send that image: %s" % e)
 
     def keep(self, msg):
         """Save what a peer sent where the agent can go and read it."""
@@ -1778,6 +1901,9 @@ class AgentChat(pygospel.GospelChat):
         if self.voices is not None:
             self.voices.check(now)
 
+        if self.renders is not None:
+            self.renders.check(now)
+
         for key in list(self.agents):
             agent = self.agents[key]
 
@@ -1812,6 +1938,9 @@ class AgentChat(pygospel.GospelChat):
 
         if self.voices is not None:
             self.voices.close()
+
+        if self.renders is not None:
+            self.renders.close()
 
         super().close()
 
@@ -1851,6 +1980,10 @@ def main():
     ap.add_argument("--transcribe",
         help="a command that prints the words of the audio file it is given "
         "as its last argument, see tools/transcribe.py")
+    ap.add_argument("--render",
+        help="a command that answers !render, it reads the prompt on stdin "
+        "and writes a PNG to the path given as its last argument, see "
+        "tools/render.py")
     ap.add_argument("--avatar",
         help="a picture to show peers for this device, a PNG, JPEG, GIF or "
         "WebP of at most 32 KiB")

@@ -1902,11 +1902,13 @@ class _Tunnel:
         if self.cathedral.alive:
             self.cathedral.alive = False
 
+        relayed = self.relay
+
         self.chat._cathedral_pick(self.cathedral)
         self.next_notify = 0
 
-        if not self.relay:
-            self._p2p_off()
+        if relayed:
+            self.addr = self.cathedral.addr
 
     def _follow_p2p(self):
         """Traffic that did not come from the cathedral is a path to use."""
@@ -3004,7 +3006,9 @@ class GospelChat:
         if target.active and _ms() - target.active < TUNNEL_IDLE:
             return 1
 
-        if target.present and not self.tunnel_online(target.id):
+        tunnel = target.signal_tunnel
+
+        if target.present and (tunnel is None or not tunnel.alive):
             return 1
 
         return 0

@@ -373,6 +373,22 @@ That runs on this machine, and the audio is deleted once it has its words. A
 transcript is marked as one, so it cannot run a command or answer a permission
 question. In a group an agent only takes data with `--group-all`.
 
+`!render <prompt>` draws an image and sends it back, without involving the
+agent. It needs `--render`, a command that reads the prompt on stdin and writes
+a PNG to the path it is given as its last argument. `tools/render.py` does that
+with Z-Image-Turbo on a GPU, downloading the models the first time:
+
+```
+$ python3 -m venv ~/render
+$ ~/render/bin/pip install torch diffusers transformers accelerate gguf
+$ python3 examples/agent.py -c gospel.conf -a 02 \
+    --render "$HOME/render/bin/python tools/render.py"
+```
+
+Only devices in `--allow` can ask, one image is drawn at a time, and a group
+needs no mention for it. The model is loaded for each image and gone from the
+GPU afterwards, so asking takes a little longer and costs nothing in between.
+
 While a job runs, the agent says how it is doing every minute: how long it has
 been at it, how many tools it ran, the last one, and what the backend reports.
 That is context use, session tokens and cost for `pi`, context and tokens
@@ -485,6 +501,7 @@ Your neighborhood LLM
 | `examples/` | a terminal client, an echo bot, a flock watcher, an agent peer |
 | `tools/cathedral/` | fetches sanctum, runs a cathedral, talks to it |
 | `tools/transcribe.py` | the words of an audio file, for agents |
+| `tools/render.py` | an image from a prompt, for agents |
 | `tools/check-style.py` | tabs, alignment and column checks |
 | `tools/align.py` | applies what check-style.py asks for |
 | `dist-build/` | fetching, patching and building libkyrka and sanctum |

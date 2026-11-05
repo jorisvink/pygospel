@@ -136,7 +136,7 @@ class Quiet(agent.ClaudeAgent):
 
 def opts(tmp, **kwargs):
     fields = dict(claude="claude", dir="/work", model=None, idle=900,
-        max_out=4096, progress=False, stats=0, transcribe=None,
+        max_out=4096, progress=False, stats=0, transcribe=None, render=None,
         inbox=os.path.join(tmp, "inbox"),
         sessions=os.path.join(tmp, "state", "sessions.json"))
     fields.update(kwargs)
@@ -1503,6 +1503,200 @@ def test_files_are_kept():
         with open(path, "rb") as f:
             check("contents", f.read(), b"png")
 
+        chat.close()
+
+
+def render_room(tmp, body=None, **kwargs):
+    if body is not None:
+        kwargs["render"] = script(tmp, body)
+
+    chat = room(tmp, **kwargs)
+    chat.sent = []
+
+    def send_image(peer, path):
+        with open(path, "rb") as f:
+            chat.sent.append((peer, f.read()))
+
+    def send_group_image(path):
+        send_image(None, path)
+
+    chat.send_image = send_image
+    chat.send_group_image = send_group_image
+    chat.conversation = lambda msg: types.SimpleNamespace(
+        feed=lambda msg: chat.fed.append(msg.text))
+
+    return chat
+
+
+def asks(chat, text, **kwargs):
+    msg = message(text, **kwargs)
+    msg.mentions_me = False
+
+    agent.AgentChat.on_message(chat, msg)
+
+
+def wait_render(chat):
+    for _ in range(500):
+        if chat.renders.proc is None and not chat.renders.queue:
+            return
+
+        fd = chat.renders.fd
+
+        if select.select([fd], [], [], 0.05)[0]:
+            chat.renders.on_output(fd)
+
+
+def test_render_sends_the_image():
+    with tempfile.TemporaryDirectory() as tmp:
+        seen = os.path.join(tmp, "seen")
+        chat = render_room(tmp, 'cat > %s; echo "$#" > %s.argc; '
+            'printf drawn > "$1"' % (seen, seen))
+
+        asks(chat, "!render -rf a cat\non a roof")
+
+        folder = chat.renders.dir
+
+        ok("a private folder", os.stat(folder).st_mode & 0o777 == 0o700)
+        wait_render(chat)
+
+        check("the image", chat.sent, [(0x02, b"drawn")])
+        check("no agent", chat.fed, [])
+        check("nothing said", chat.said, [])
+
+        with open(seen) as f:
+            check("the prompt on stdin", f.read(), "-rf a cat\non a roof")
+
+        with open(seen + ".argc") as f:
+            check("only the path as an argument", f.read().strip(), "1")
+
+        ok("nothing left", not os.path.exists(folder))
+        chat.close()
+
+
+def test_render_needs_a_prompt_and_a_renderer():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = render_room(tmp)
+        asks(chat, "!render a cat")
+        ok("no renderer", "--render" in chat.said[0])
+        chat.close()
+
+        chat = render_room(tmp, 'printf drawn > "$1"')
+        asks(chat, "!render")
+        ok("no prompt", "say what to draw" in chat.said[0])
+        check("nothing ran", chat.renders.proc, None)
+        chat.close()
+
+
+def test_render_only_from_who_is_allowed():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = render_room(tmp, 'printf drawn > "$1"')
+
+        asks(chat, "!render a cat", author=0x09)
+
+        check("nothing ran", chat.renders.proc, None)
+        check("nothing said", chat.said, [])
+        chat.close()
+
+
+def test_render_is_only_the_command():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = render_room(tmp, 'printf drawn > "$1"')
+
+        for text in ("!renderer on", "please !render a cat"):
+            asks(chat, text)
+
+            check("not a render: " + text, chat.renders.proc, None)
+
+        check("the agent got them", chat.fed,
+            ["!renderer on", "please !render a cat"])
+        asks(chat, "!RENDER a cat")
+        ok("any case", chat.renders.proc is not None)
+        wait_render(chat)
+        chat.close()
+
+
+def test_render_failures_are_told():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = render_room(tmp, "exit 3")
+        asks(chat, "!render a cat")
+        wait_render(chat)
+        ok("a bad exit", "status 3" in chat.said[0])
+        check("no image", chat.sent, [])
+        chat.close()
+
+        chat = render_room(tmp, render=os.path.join(tmp, "nothing"))
+        asks(chat, "!render a cat")
+        ok("no such command", "could not draw" in chat.said[0])
+        chat.close()
+
+        chat = render_room(tmp, "exit 0")
+        asks(chat, "!render a cat")
+        wait_render(chat)
+        ok("no image written", "wrote no image" in chat.said[0])
+        check("nothing sent", chat.sent, [])
+        chat.close()
+
+
+def test_render_stuck_is_killed():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = render_room(tmp, "exec sleep 60")
+
+        asks(chat, "!render a cat")
+        chat.renders.started -= agent.RENDER_MAX + 1
+        chat.renders.check(agent.time.monotonic())
+        wait_render(chat)
+
+        ok("said so", "could not draw" in chat.said[0])
+        chat.close()
+
+
+def test_render_one_at_a_time():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = render_room(tmp, 'cat > "$1"')
+
+        asks(chat, "!render one")
+        asks(chat, "!render two")
+        ok("said it waits", "1 ahead" in chat.said[0])
+        wait_render(chat)
+
+        check("in order", chat.sent, [(0x02, b"one"), (0x02, b"two")])
+        chat.close()
+
+
+def test_render_in_a_group():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = render_room(tmp, 'printf drawn > "$1"', group=0x0007)
+
+        asks(chat, "!render a cat", group=0x0007)
+        wait_render(chat)
+
+        check("to the group, no mention needed", chat.sent,
+            [(None, b"drawn")])
+        chat.close()
+
+
+def test_render_stays_out_of_another_group():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = render_room(tmp, 'printf drawn > "$1"', group=0x0007)
+
+        asks(chat, "!render a cat", group=0x0007)
+        chat.group = 0x0009
+        wait_render(chat)
+
+        check("not sent", chat.sent, [])
+        check("not said", chat.said, [])
+        chat.close()
+
+
+def test_voice_cannot_render():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = room(tmp, transcribe=script(tmp, "echo '!render a cat'"))
+
+        chat.on_data(blob("voice"))
+        wait_voice(chat)
+
+        ok("marked", chat.fed[0].startswith("(voice message"))
+        check("not the command", agent.RENDER.match(chat.fed[0]), None)
         chat.close()
 
 

@@ -673,6 +673,86 @@ def test_cathedral_is_not_the_peer():
     two.close()
 
 
+def test_silent_cathedral_keeps_a_direct_path():
+    fresh()
+
+    chat = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True)
+    other = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True)
+
+    pump([chat, other], rounds=10)
+
+    tunnel = chat.peer(0x02).signal_tunnel
+    direct = ("192.0.2.1", 4242)
+    tunnel.addr = direct
+
+    tunnel._cathedral_check(tunnel.cathedral.last +
+        tunnel.cathedral.timeout + 1)
+
+    check("direct path stays", tunnel.addr, direct)
+    check("notify again", tunnel.next_notify, 0)
+
+    chat.cathedrals.append(("192.0.2.2", 4242))
+    tunnel._cathedral_check(tunnel.cathedral.last +
+        tunnel.cathedral.timeout + 1)
+
+    check("direct path stays on a switch", tunnel.addr, direct)
+    check("cathedral moved", tunnel.cathedral.addr, ("192.0.2.2", 4242))
+
+    chat.close()
+    other.close()
+
+
+def test_silent_cathedral_moves_a_relayed_tunnel():
+    fresh()
+
+    chat = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        signal_all=True)
+    other = pygospel.GospelChat(config(0x02), nickname="bob", p2p=False,
+        signal_all=True)
+
+    pump([chat, other], rounds=10)
+
+    tunnel = chat.peer(0x02).signal_tunnel
+    chat.cathedrals.append(("192.0.2.2", 4242))
+
+    ok("relayed first", tunnel.relay)
+
+    tunnel._cathedral_check(tunnel.cathedral.last +
+        tunnel.cathedral.timeout + 1)
+
+    check("follows the cathedral", tunnel.addr, ("192.0.2.2", 4242))
+    ok("still relayed", tunnel.relay)
+
+    chat.close()
+    other.close()
+
+
+def test_group_tunnel_does_not_stop_signaling_back():
+    fresh()
+
+    class Up:
+        alive = True
+
+    chat = pygospel.GospelChat(config(0x01), nickname="alice", p2p=False,
+        group=0)
+    target = chat.peer(0x02)
+    target.present = True
+
+    check("signal a peer that signals us", chat._signal_want(target), 1)
+
+    target.group_tunnel = Up()
+    check("still signal it with a group tunnel", chat._signal_want(target), 1)
+
+    target.signal_tunnel = Up()
+    check("not with its own tunnel up", chat._signal_want(target), 0)
+
+    target.group_tunnel = None
+    target.signal_tunnel = None
+    chat.close()
+
+
 def test_reply_waits_for_heartbeat():
     fresh()
 
