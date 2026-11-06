@@ -17,10 +17,13 @@ sys.path.insert(0, HERE)
 sys.path.insert(0, os.path.join(HERE, "..", "src"))
 
 import fakekyrka  # noqa: E402
+import fakeopus  # noqa: E402
 
 sys.modules["libkyrka"] = fakekyrka.Module(fakekyrka.Network())
 
 import pygospel  # noqa: E402
+
+pygospel.opuslib = fakeopus
 
 
 KEK   = "11" * 32
@@ -2902,6 +2905,468 @@ def test_group_data():
 
     a.close()
     b.close()
+
+
+#
+# Calls.
+#
+
+class Caller(pygospel.GospelChat):
+    """A chat that keeps what its calls tell it."""
+
+    def __init__(self, *args, answer=False, **kwargs):
+        self.rang = []
+        self.ended = []
+        self.heard = []
+        self.started = []
+        self.answers = answer
+        super().__init__(*args, **kwargs)
+
+    def on_call_ring(self, call):
+        self.rang.append(call)
+
+        if self.answers:
+            call.answer()
+
+    def on_call_talking(self, call):
+        self.started.append(call)
+
+    def on_call_audio(self, call, pcm):
+        self.heard.append(pcm)
+
+    def on_call_end(self, call, reason):
+        self.ended.append(reason)
+
+
+def tone(value):
+    return bytes([value]) * pygospel.VOICE_BYTES
+
+
+def callers(answer=False):
+    net = fresh()
+
+    return (net, Caller(config(1)),
+        Caller(config(2), take_calls=True, answer=answer))
+
+
+def talking(answer=True):
+    """Two chats on a call that has been set up."""
+
+    net, alice, bob = callers(answer)
+    call = alice.call(2)
+
+    pump([alice, bob], rounds=6)
+    pump([alice, bob], rounds=10, ms=20)
+
+    return net, alice, bob, call, bob.active_call
+
+
+def test_voice_frame():
+    frame = pygospel.voice_pack(pygospel.VOICE_AUDIO, 0x0102, b"abc")
+
+    check("voice size", len(frame), 160)
+    check("voice head", frame[:6], b"\x01\x00\x01\x02\x00\x03")
+    check("voice opus", frame[6:9], b"abc")
+    check("voice pad", frame[9:], bytes(151))
+    check("voice back", pygospel.voice_unpack(frame),
+        (pygospel.VOICE_AUDIO, 0x0102, b"abc"))
+    check("hangup size", len(pygospel.voice_pack(pygospel.VOICE_HANGUP)), 160)
+    check("short frame", pygospel.voice_unpack(frame[:159]), None)
+    check("long frame", pygospel.voice_unpack(frame + b"x"), None)
+    check("bad length", pygospel.voice_unpack(
+        struct.pack("!BBHH", 1, 0, 1, 155) + bytes(154)), None)
+    boom("too much opus", lambda: pygospel.voice_pack(1, 1, bytes(155)))
+
+
+def test_call_contexts():
+    net, alice, bob = callers()
+
+    lit = bob.call_signaling
+    flock = int(FLOCK, 16) | 0x0a
+
+    check("signals in the call domain", lit.ctx.flock_src, flock)
+    check("signals in liturgy_group", lit.ctx.group, 1)
+    check("signals as itself", lit.ctx.tunnel, 2)
+    check("signaling remembers", lit.ctx.remembrance, True)
+    check("no liturgy without a call", alice.call_signaling, None)
+
+    call = alice.call(2)
+
+    check("tunnel is ours then theirs", call.ctx.tunnel, 0x0102)
+    check("tunnel is in the call domain", call.ctx.flock_src, flock)
+    check("tunnel in no group", call.ctx.group, 0)
+    check("tunnel has the kek", call.ctx.kek is not None, True)
+    check("mtu is capped", call.ctx.mtu, 1100)
+    ok("liturgy for the dialer", alice.call_signaling is not None)
+
+    small = Caller(config(3, mtu=800))
+
+    check("smaller mtu stays", small.call(1).ctx.mtu, 800)
+
+
+def test_call_serial_is_signaled():
+    net, alice, bob = callers()
+    call = alice.call(2)
+
+    pump([alice], rounds=1)
+
+    want = alice.call_signaling.ctx.wanted
+
+    ok("a serial, never 0", 1 <= call.serial <= 255)
+    check("only for that peer", want[2], call.serial)
+    check("nobody else", sum(1 for b in want if b), 1)
+
+    call.hangup()
+    pump([alice], rounds=2, ms=20)
+
+    check("stops at a hangup", alice.call_signaling.ctx.wanted[2], 0)
+
+
+def test_call_rings_only_with_a_tunnel():
+    net, alice, bob = callers()
+
+    bob._call_push(bytes([0, 7]) + bytes(253))
+    pump([bob], rounds=1)
+
+    ok("working on it", bob.active_call is not None)
+    check("incoming", bob.active_call.incoming, True)
+    check("connecting", bob.active_call.state, "connecting")
+    check("no ring without a tunnel", bob.rang, [])
+
+    alice.call(2)
+    pump([alice, bob], rounds=6)
+
+    check("rings once it is proven", len(bob.rang), 1)
+    check("ringing", bob.active_call.state, "ringing")
+    check("the right peer", bob.rang[0].peer.id, 1)
+    check("the other side waits", alice.active_call.state, "online")
+    check("no audio before an answer", alice.active_call.tx_frames, 0)
+
+
+def test_call_needs_take_calls():
+    net = fresh()
+    alice = Caller(config(1))
+    bob = Caller(config(2))
+
+    call = alice.call(2)
+
+    pump([alice, bob], rounds=62)
+
+    check("nothing rang", bob.rang, [])
+    check("no call here", bob.active_call, None)
+    check("the caller gives up", alice.ended, ["timeout"])
+    check("and says so", call.reason, "timeout")
+    check("and it is gone", call.state, "ended")
+    check("free again", alice.active_call, None)
+
+
+def test_call_talks_both_ways():
+    net, alice, bob, ours, theirs = talking()
+
+    check("caller talks", ours.state, "talking")
+    check("callee talks", theirs.state, "talking")
+    check("told once", (len(alice.started), len(bob.started)), (1, 1))
+    check("nobody ended", alice.ended + bob.ended, [])
+
+    del alice.heard[:], bob.heard[:]
+
+    ours.send_audio(tone(5) + tone(6))
+    theirs.send_audio(tone(9))
+
+    pump([alice, bob], rounds=6, ms=20)
+
+    ok("bob heard alice", tone(5) in bob.heard and tone(6) in bob.heard)
+    ok("in order", bob.heard.index(tone(5)) < bob.heard.index(tone(6)))
+    ok("alice heard bob", tone(9) in alice.heard)
+    check("silence after that", bob.heard[-1], tone(0))
+    check("nothing left", ours.queued, 0)
+    check("status knows", alice.status()["call"],
+        {"peer": "02", "state": "talking", "link": "relay"})
+
+
+def test_call_is_a_steady_stream():
+    net, alice, bob, ours, theirs = talking()
+
+    before = ours.tx_frames
+    del net.frames[:]
+
+    pump([alice, bob], rounds=50, ms=20)
+
+    check("fifty frames a second", ours.tx_frames - before, 50)
+    check("all the same size",
+        set(size for _, size in net.frames), {160})
+
+    before = ours.tx_frames
+    pygospel.time.sleep(10)
+    pump([alice, bob], rounds=1, ms=20)
+
+    ok("no burst after a stall", ours.tx_frames - before <= 2)
+
+
+def test_call_partial_audio_waits():
+    net, alice, bob, ours, theirs = talking()
+
+    half = tone(3)[:960]
+
+    ours.send_audio(half)
+    check("half a frame is 10 ms", ours.queued, 10)
+
+    pump([alice, bob], rounds=3, ms=20)
+    check("it waits for the rest", ours.queued, 10)
+
+    ours.send_audio(half)
+    pump([alice, bob], rounds=3, ms=20)
+
+    check("sent once it is whole", ours.queued, 0)
+    ok("arrived", tone(3) in bob.heard)
+
+    ours.send_audio(tone(4) * 10)
+    ours.clear_audio()
+    check("cleared", ours.queued, 0)
+
+    boom("half a sample", lambda: ours.send_audio(b"abc"))
+    boom("too much", lambda: ours.send_audio(
+        bytes(pygospel.CALL_AUDIO_MAX + 2)))
+
+
+def test_call_loss_is_repaired():
+    net, alice, bob, ours, theirs = talking()
+
+    theirs._rx_seq = 100
+    del bob.heard[:]
+
+    def frame(seq, value):
+        theirs.on_frame(pygospel.voice_pack(pygospel.VOICE_AUDIO, seq,
+            bytes([value])))
+
+    frame(101, 1)
+    check("in order plays", bob.heard, [tone(1)])
+
+    del bob.heard[:]
+    frame(103, 2)
+    check("one lost comes from fec", bob.heard,
+        [tone(fakeopus.FEC), tone(2)])
+
+    del bob.heard[:]
+    frame(106, 3)
+    check("more lost are concealed", bob.heard,
+        [tone(fakeopus.PLC), tone(fakeopus.FEC), tone(3)])
+
+    del bob.heard[:]
+    frame(106, 4)
+    frame(105, 4)
+    check("late and duplicate are dropped", bob.heard, [])
+
+    theirs._rx_seq = 0xffff
+    frame(1, 5)
+    ok("the sequence wraps", tone(5) in bob.heard)
+
+    del bob.heard[:]
+    frame(0, 6)
+    check("0 has no sequence", bob.heard, [tone(6)])
+
+    del bob.heard[:]
+    theirs.on_frame(b"\x03" + bytes(2000))
+    theirs.on_frame(bytes(10))
+    theirs.on_frame(pygospel.voice_pack(4))
+    check("other frames mean nothing", bob.heard, [])
+    check("still up", theirs.ending, None)
+
+
+def test_call_decline():
+    net, alice, bob = callers()
+    call = alice.call(2)
+
+    pump([alice, bob], rounds=6)
+    bob.rang[0].hangup()
+    check("hanging up", bob.rang[0].state, "hanging up")
+
+    pump([alice, bob], rounds=10, ms=200)
+
+    check("the caller is told", alice.ended, ["remote"])
+    check("we did it", bob.ended, ["local"])
+    check("nothing talked", (len(alice.started), len(bob.started)), (0, 0))
+    check("both free", (alice.active_call, bob.active_call), (None, None))
+    boom("no answering now", lambda: bob.rang[0].answer())
+
+
+def test_call_ended_does_not_ring_again():
+    net, alice, bob = callers()
+    alice.call(2)
+
+    pump([alice, bob], rounds=6)
+    bob.rang[0].hangup()
+
+    # The dialer takes a moment to stop, this is what is still signaled.
+    bob._callers[1][1] = pygospel._ms()
+    pump([bob], rounds=10, ms=200)
+
+    check("declined", bob.ended, ["local"])
+
+    bob._call_push(bytes([0, bob._callers[1][0]]) + bytes(253))
+    pump([bob], rounds=2, ms=200)
+
+    check("same call stays down", (bob.active_call, len(bob.rang)), (None, 1))
+
+    pump([alice, bob], rounds=12)
+
+    alice.call(2)
+    pump([alice, bob], rounds=6)
+
+    check("a new call rings", len(bob.rang), 2)
+
+
+def test_call_hangup_while_talking():
+    net, alice, bob, ours, theirs = talking()
+
+    theirs.hangup()
+    pump([alice, bob], rounds=2, ms=20)
+
+    check("the other side hears it", alice.ended, ["remote"])
+    check("still lingering here", bob.ended, [])
+
+    pump([bob], rounds=6, ms=200)
+
+    check("then done", bob.ended, ["local"])
+    check("reason is kept", ours.reason, "remote")
+
+    ours.hangup()
+    ours.send_audio(tone(1))
+    boom("no answer", lambda: ours.answer())
+
+
+def test_call_goes_quiet():
+    net, alice, bob, ours, theirs = talking()
+
+    pump([alice], rounds=19)
+    check("still up at 19", alice.ended, [])
+
+    pump([alice], rounds=2)
+    check("gone at 20", alice.ended, ["timeout"])
+
+
+def test_call_caller_never_shows_up():
+    fresh()
+    bob = Caller(config(2), take_calls=True)
+
+    for _ in range(11):
+        bob._call_push(bytes([0, 7]) + bytes(253))
+        pump([bob], rounds=1)
+
+    check("not proven in time", bob.ended, ["timeout"])
+    check("never rang", bob.rang, [])
+
+
+def test_call_caller_gives_up():
+    fresh()
+    bob = Caller(config(2), take_calls=True)
+
+    bob._call_push(bytes([0, 7]) + bytes(253))
+    pump([bob], rounds=11)
+
+    check("gone with its signal", bob.ended, ["remote"])
+    check("never rang", bob.rang, [])
+
+
+def test_call_one_at_a_time():
+    net = fresh()
+    alice = Caller(config(1))
+    bob = Caller(config(2), take_calls=True, answer=True)
+    carol = Caller(config(3))
+
+    alice.call(2)
+    boom("a second one", lambda: alice.call(3))
+    boom("ourselves", lambda: carol.call(3))
+    boom("a bad id", lambda: carol.call(0))
+
+    pump([alice, bob, carol], rounds=6)
+
+    carol.call(2)
+    pump([alice, bob, carol], rounds=6)
+
+    check("the first stays", bob.active_call.peer.id, 1)
+    check("one ring", len(bob.rang), 1)
+
+    alice.active_call.hangup()
+    pump([alice, bob, carol], rounds=6)
+
+    check("then the next", bob.active_call.peer.id, 3)
+
+
+def test_call_close_hangs_up():
+    net, alice, bob, ours, theirs = talking()
+
+    alice.close()
+    check("ended by us", alice.ended, ["local"])
+
+    pump([bob], rounds=2, ms=20)
+    check("the peer was told", bob.ended, ["remote"])
+
+
+def test_call_does_not_disturb_chats():
+    net, alice, bob, ours, theirs = talking()
+
+    got = []
+    bob.on_message = lambda msg: got.append(msg.text)
+
+    alice.send(2, "still here")
+    pump([alice, bob], rounds=8)
+
+    check("chat still works", got, ["still here"])
+    ok("a chat tunnel of its own",
+        alice.peer(2).signal_tunnel is not None and
+        alice.peer(2).signal_tunnel.ctx.flock_src != ours.ctx.flock_src)
+
+
+def test_call_lists_who_is_online():
+    fresh()
+
+    one = Caller(config(1), discoverable=True)
+    two = Caller(config(2), discoverable=True)
+    far = Caller(config(3, group="0009"), discoverable=True)
+
+    pump([one, two, far], rounds=8)
+
+    check("the same group", one.callable, {2})
+    check("and the other way", two.callable, {1})
+    check("another group", far.callable, set())
+    check("status has it", one.status()["callable"], ["02"])
+
+
+def test_call_needs_opus():
+    fresh()
+
+    pygospel.opuslib = None
+    sys.modules["opuslib"] = None
+
+    try:
+        boom("take_calls says so at the start",
+            lambda: pygospel.GospelChat(config(2), take_calls=True))
+
+        chat = pygospel.GospelChat(config(1))
+
+        boom("so does call", lambda: chat.call(2))
+        check("nothing was left behind", chat.active_call, None)
+    finally:
+        pygospel.opuslib = fakeopus
+        del sys.modules["opuslib"]
+
+
+def test_call_opus_is_set_up_like_vigil():
+    fresh()
+
+    codec = pygospel._Codec()
+    state = codec.encoder.encoder_state
+
+    check("voip", codec.encoder.application, fakeopus.APPLICATION_VOIP)
+    check("rate", (codec.encoder.fs, codec.decoder.fs), (48000, 48000))
+    check("mono", (codec.encoder.channels, codec.decoder.channels), (1, 1))
+    check("controls", state.ctl, {"bitrate": fakeopus.AUTO,
+        "signal": fakeopus.SIGNAL_VOICE, "fec": 1, "loss": 5})
+    check("room in a frame", state.max_bytes, None)
+
+    codec.encode(tone(1))
+    check("the limit is a frame", state.max_bytes, 154)
 
 
 def main():

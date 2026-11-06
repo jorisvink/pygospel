@@ -2,10 +2,11 @@
 Gospel chats, driven by the libkyrka python module.
 
 Gospel is the protocol Vigil uses for calls and messages over sanctum
-tunnels. This module speaks the chat part of it: it sends and receives text
-messages, sends images and with take_data receives images, files and voice
-messages, in one-to-one chats and in group chats. It is compatible with Vigil
-and with confession, and it claims no other ability.
+tunnels. This module sends and receives text messages, sends images and with
+take_data receives images, files and voice messages, in one-to-one chats and
+in group chats. It also makes and with take_calls takes voice calls, the only
+part that needs anything extra, opuslib. It is compatible with Vigil and with
+confession, and it claims no other ability.
 
 The fastest way in:
 
@@ -47,6 +48,8 @@ import struct
 import hashlib
 import selectors
 
+opuslib = None
+
 
 class KyrkaMissing(ImportError):
     """
@@ -79,9 +82,10 @@ except ImportError:
     raise KyrkaMissing()
 
 __all__ = [
-    "GospelChat", "GospelConfig", "GospelError", "KyrkaMissing", "Message",
-    "Peer", "Quote",
+    "Call", "GospelChat", "GospelConfig", "GospelError", "KyrkaMissing",
+    "Message", "Peer", "Quote",
     "frame_pack", "frame_unpack", "heartbeat_pack", "heartbeat_unpack",
+    "voice_pack", "voice_unpack",
 ]
 
 #
@@ -230,6 +234,50 @@ BUSY_POLL = 0.01
 
 # Where a Vigil configuration ends up if it does not say.
 MTU_DEFAULT = 1408
+
+# A voice frame, which is the same size whether it carries speech, silence or
+# a hangup.
+#
+#   struct vigil_voice_hdr {
+#     uint8 type; uint8 rfu; uint16 seq; uint16 length;
+#   }
+#
+VOICE_HEAD     = struct.Struct("!BBHH")
+VOICE_PAYLOAD  = 160
+VOICE_OPUS_MAX = VOICE_PAYLOAD - VOICE_HEAD.size
+VOICE_AUDIO    = 1
+VOICE_HANGUP   = 2
+
+# The audio on a call: 16 bit signed mono, in frames of 20 milliseconds.
+VOICE_RATE     = 48000
+VOICE_SAMPLES  = 960
+VOICE_BYTES    = VOICE_SAMPLES * 2
+VOICE_INTERVAL = 20
+VOICE_LOSS     = 5
+VOICE_SILENCE  = bytes(VOICE_BYTES)
+
+# What a call is doing: we dialed, it rings here, we picked up, we want out.
+CALL_DIAL    = 1
+CALL_RING    = 2
+CALL_ANSWER  = 3
+CALL_DECLINE = 4
+
+# In milliseconds, these are the ones a call in Vigil lives by.
+CALL_CONNECT     = 60 * 1000
+CALL_RING_VERIFY = 10 * 1000
+CALL_DECLINE_MAX = 5 * 1000
+CALL_LINGER      = 1000
+CALL_HANGUP_NEXT = 200
+CALL_RX_TIMEOUT  = 20 * 1000
+CALL_GRACE       = 5 * 1000
+CALL_P2P_VERIFY  = 10 * 1000
+
+# Hangups sent at a time, the largest packet of a call, the frames a stalled
+# call catches up on and the bytes of audio we are willing to hold.
+CALL_HANGUPS   = 3
+CALL_MTU_MAX   = 1100
+CALL_CATCHUP   = 5
+CALL_AUDIO_MAX = 5 * 60 * VOICE_RATE * 2
 
 
 class GospelError(Exception):
@@ -450,6 +498,32 @@ class _Verifier:
         cls.get()
 
         return cls.why
+
+
+def voice_pack(vtype, seq=0, opus=b""):
+    """A voice frame, padded to the size every one of them has."""
+
+    if len(opus) > VOICE_OPUS_MAX:
+        raise GospelError("a voice frame carries at most %d bytes"
+            % VOICE_OPUS_MAX)
+
+    frame = VOICE_HEAD.pack(vtype, 0, seq, len(opus)) + opus
+
+    return frame.ljust(VOICE_PAYLOAD, b"\x00")
+
+
+def voice_unpack(buf):
+    """The type, sequence and opus of a voice frame, None if it is not one."""
+
+    if len(buf) != VOICE_PAYLOAD:
+        return None
+
+    vtype, _, seq, length = VOICE_HEAD.unpack_from(buf)
+
+    if length > VOICE_OPUS_MAX:
+        return None
+
+    return vtype, seq, bytes(buf[VOICE_HEAD.size:VOICE_HEAD.size + length])
 
 
 def frame_pack(msgid, ftype, payload=b"", length=None):
@@ -1144,50 +1218,29 @@ class _Liturgy:
         self.chat._forget(self)
 
 
-class _Tunnel:
+class _Link:
     """
-    A chat tunnel to one peer, either a one-to-one one or one that is in
-    the group we joined. Both carry exactly the same frames; a group tunnel
-    keeps its unacked messages to itself instead of in the peer outbox,
-    because a peer that leaves the group no longer owes us anything.
+    A libkyrka context with its own socket to one peer, and the path to it:
+    relayed through a cathedral, or direct when the cathedral says we can
+    try that. A chat tunnel and a call are both one of these.
     """
 
-    def __init__(self, chat, peer, group):
+    VERIFY = P2P_VERIFY
+
+    def __init__(self, chat, addr=None, mtu=None):
         self.chat = chat
-        self.peer = peer
-        self.group = group
-        self.is_group = group != SIGNAL_GROUP
-
         self.sock = chat._new_socket()
-        self.ctx = chat._new_context(self, kek=True)
+        self.ctx = chat._new_context(self, kek=True, mtu=mtu)
 
-        self.local_uid = os.urandom(8)
-        self.remote_uid = None
-        self.next_msgid = 1
-
-        self.cathedral = _Cathedral(chat.cathedrals[0])
+        self.cathedral = _Cathedral(addr or chat.cathedrals[0])
         self.addr = self.cathedral.addr
         self.source = None
         self.online = 0
         self.last_rx = 0
-        self.greeted = False
-        self.heard = False
-        self.features = 0
-        self.typing_sent = False
 
         self.next_heartbeat = 0
         self.next_notify = 0
         self.next_manage = 0
-
-        self.sendq = []
-        self.waitq = []
-        self.xfer = None
-        self.rxfer = None
-        self.avatar = None
-        self.avatar_serial = 0
-        self.avatar_have = 0
-        self.seen = [_Seen() for _ in range(SEEN_MAX)]
-        self.seen_next = 0
 
         self.holepunch = 0
         self.p2p_addr = None
@@ -1199,6 +1252,147 @@ class _Tunnel:
         self.closed = False
 
         chat._register(self.sock, self)
+
+    @property
+    def relay(self):
+        return self.addr == self.cathedral.addr
+
+    def hops(self):
+        """Commixtion rides the shroud, so it needs the shroud turned on."""
+
+        if self.chat.commixtion and self.chat.shroud:
+            return COMMIXTION_HOPS
+
+        return 0
+
+    def send_frame(self, data):
+        shroud = libkyrka.KYRKA_PACKET_SHROUD_CATHEDRAL if self.relay \
+            else libkyrka.KYRKA_PACKET_SHROUD_PEER
+
+        return self.chat._heaven_input(self.ctx, data, shroud)
+
+    def upkeep(self, now):
+        """The cathedral, the path and the keys, whatever else we carry."""
+
+        self._cathedral_check(now)
+
+        if self.p2p_verify != 0 and now >= self.p2p_verify:
+            self._p2p_fail()
+
+        if now >= self.next_notify:
+            self.next_notify = now + NOTIFY_INTERVAL
+            self.chat._notify(self.ctx)
+
+            if self.chat.p2p:
+                self.chat._nat_detection(self.ctx)
+
+        if now >= self.next_manage:
+            self.next_manage = now + MANAGE_INTERVAL
+            self.chat._manage(self.ctx)
+
+    def went_online(self):
+        pass
+
+    #
+    # Working out where to send things.
+    #
+
+    def _cathedral_check(self, now):
+        if (now - self.cathedral.last) <= self.cathedral.timeout:
+            return
+
+        if self.cathedral.alive:
+            self.cathedral.alive = False
+
+        relayed = self.relay
+
+        self.chat._cathedral_pick(self.cathedral)
+        self.next_notify = 0
+
+        if relayed:
+            self.addr = self.cathedral.addr
+
+    def _follow_p2p(self):
+        """Traffic that did not come from the cathedral is a path to use."""
+
+        if not self.chat.p2p or self.source is None:
+            return
+
+        if self.source == self.addr:
+            self.p2p_backoff = 0
+            self.p2p_rx = _ms()
+            self.p2p_verify = 0
+            self.p2p_retry = 0
+            return
+
+        if not self.relay or self.source != self.p2p_addr:
+            return
+
+        self.addr = self.source
+        self.p2p_rx = _ms()
+        self.p2p_retry = 0
+        self.p2p_verify = _ms() + self.VERIFY
+        self.holepunch = _ms() + HOLEPUNCH
+        self.next_heartbeat = _ms()
+
+        self.chat._p2p_active(self.ctx, 1)
+
+    def _abandon_p2p(self):
+        if self.relay or self.p2p_verify != 0:
+            return
+
+        if (_ms() - self.p2p_rx) < P2P_SILENT:
+            return
+
+        self._p2p_fail()
+
+    def _p2p_fail(self):
+        if self.p2p_backoff == 0:
+            self.p2p_backoff = P2P_RETRY
+        else:
+            self.p2p_backoff = min(self.p2p_backoff * 2, P2P_RETRY_MAX)
+
+        self.p2p_verify = 0
+        self.p2p_retry = _ms() + self.p2p_backoff
+        self.p2p_failed = self.addr
+        self.addr = self.cathedral.addr
+
+        self.chat._p2p_active(self.ctx, 0)
+
+
+class _Tunnel(_Link):
+    """
+    A chat tunnel to one peer, either a one-to-one one or one that is in
+    the group we joined. Both carry exactly the same frames; a group tunnel
+    keeps its unacked messages to itself instead of in the peer outbox,
+    because a peer that leaves the group no longer owes us anything.
+    """
+
+    def __init__(self, chat, peer, group):
+        super().__init__(chat)
+
+        self.peer = peer
+        self.group = group
+        self.is_group = group != SIGNAL_GROUP
+
+        self.local_uid = os.urandom(8)
+        self.remote_uid = None
+        self.next_msgid = 1
+
+        self.greeted = False
+        self.heard = False
+        self.features = 0
+        self.typing_sent = False
+
+        self.sendq = []
+        self.waitq = []
+        self.xfer = None
+        self.rxfer = None
+        self.avatar = None
+        self.avatar_serial = 0
+        self.avatar_have = 0
+        self.seen = [_Seen() for _ in range(SEEN_MAX)]
+        self.seen_next = 0
 
         if self.is_group:
             peer.group_tunnel = self
@@ -1214,13 +1408,9 @@ class _Tunnel:
         flock = self.chat.flock | (GROUP_DOMAIN if self.is_group
             else FLOCK_DOMAIN)
 
-        # Commixtion rides the shroud, so it needs the shroud turned on.
-        hops = COMMIXTION_HOPS if self.chat.commixtion and self.chat.shroud \
-            else 0
-
         self.ctx.cathedral_configure(**self.chat._cathedral_cfg(
             self, (self.chat.spi << TUNNEL_SHIFT) | self.peer.id,
-            0, flock, False, hops))
+            0, flock, False, self.hops()))
 
     @property
     def alive(self):
@@ -1229,9 +1419,8 @@ class _Tunnel:
 
         return (_ms() - self.last_rx) < RX_TIMEOUT
 
-    @property
-    def relay(self):
-        return self.addr == self.cathedral.addr
+    def went_online(self):
+        self.chat._emit("on_peer", self.peer)
 
     def _held(self):
         return self.waitq if self.is_group else self.peer.outbox
@@ -1256,12 +1445,6 @@ class _Tunnel:
 
         # Due right away, _resend() decides when its turn has come.
         held.age = 0
-
-    def send_frame(self, data):
-        shroud = libkyrka.KYRKA_PACKET_SHROUD_CATHEDRAL if self.relay \
-            else libkyrka.KYRKA_PACKET_SHROUD_PEER
-
-        return self.chat._heaven_input(self.ctx, data, shroud)
 
     def send_heartbeat(self):
         self.greeted = True
@@ -1298,21 +1481,7 @@ class _Tunnel:
 
         now = _ms()
 
-        self._cathedral_check(now)
-
-        if self.p2p_verify != 0 and now >= self.p2p_verify:
-            self._p2p_fail()
-
-        if now >= self.next_notify:
-            self.next_notify = now + NOTIFY_INTERVAL
-            self.chat._notify(self.ctx)
-
-            if self.chat.p2p:
-                self.chat._nat_detection(self.ctx)
-
-        if now >= self.next_manage:
-            self.next_manage = now + MANAGE_INTERVAL
-            self.chat._manage(self.ctx)
+        self.upkeep(now)
 
         if not self.online:
             return
@@ -1891,72 +2060,6 @@ class _Tunnel:
 
         return slot
 
-    #
-    # Working out where to send things.
-    #
-
-    def _cathedral_check(self, now):
-        if (now - self.cathedral.last) <= self.cathedral.timeout:
-            return
-
-        if self.cathedral.alive:
-            self.cathedral.alive = False
-
-        relayed = self.relay
-
-        self.chat._cathedral_pick(self.cathedral)
-        self.next_notify = 0
-
-        if relayed:
-            self.addr = self.cathedral.addr
-
-    def _follow_p2p(self):
-        """Traffic that did not come from the cathedral is a path to use."""
-
-        if not self.chat.p2p or self.source is None:
-            return
-
-        if self.source == self.addr:
-            self.p2p_backoff = 0
-            self.p2p_rx = _ms()
-            self.p2p_verify = 0
-            self.p2p_retry = 0
-            return
-
-        if not self.relay or self.source != self.p2p_addr:
-            return
-
-        self.addr = self.source
-        self.p2p_rx = _ms()
-        self.p2p_retry = 0
-        self.p2p_verify = _ms() + P2P_VERIFY
-        self.holepunch = _ms() + HOLEPUNCH
-        self.next_heartbeat = _ms()
-
-        self.chat._p2p_active(self.ctx, 1)
-
-    def _abandon_p2p(self):
-        if self.relay or self.p2p_verify != 0:
-            return
-
-        if (_ms() - self.p2p_rx) < P2P_SILENT:
-            return
-
-        self._p2p_fail()
-
-    def _p2p_fail(self):
-        if self.p2p_backoff == 0:
-            self.p2p_backoff = P2P_RETRY
-        else:
-            self.p2p_backoff = min(self.p2p_backoff * 2, P2P_RETRY_MAX)
-
-        self.p2p_verify = 0
-        self.p2p_retry = _ms() + self.p2p_backoff
-        self.p2p_failed = self.addr
-        self.addr = self.cathedral.addr
-
-        self.chat._p2p_active(self.ctx, 0)
-
     def close(self):
         if self.closed:
             return
@@ -1984,9 +2087,366 @@ class _Tunnel:
         self.chat._forget(self)
 
 
+def _opus():
+    """opuslib, which only a program that makes calls has to have."""
+
+    global opuslib
+
+    if opuslib is None:
+        try:
+            import opuslib
+            import opuslib.api.ctl
+            import opuslib.api.decoder
+            import opuslib.api.encoder
+        except Exception as e:
+            opuslib = None
+            raise GospelError("calls need opuslib and libopus: %s" % e)
+
+    return opuslib
+
+
+class _Codec:
+    """
+    The Opus encoder and decoder of one call, set up the way Vigil does.
+
+    This goes below the classes opuslib offers for three things they cannot
+    do: their encoder allows a packet as large as its input and a voice frame
+    has less room than that, their decoder cannot be asked to conceal a lost
+    packet, and their inband_fec setter drops its value.
+    """
+
+    def __init__(self):
+        opus = _opus()
+
+        self.error = opus.OpusError
+        self.encode_raw = opus.api.encoder.encode
+        self.decode_raw = opus.api.decoder.decode
+
+        try:
+            self.encoder = opus.Encoder(VOICE_RATE, 1, opus.APPLICATION_VOIP)
+            self.decoder = opus.Decoder(VOICE_RATE, 1)
+
+            for ctl, value in ((opus.api.ctl.set_bitrate, opus.AUTO),
+                (opus.api.ctl.set_signal, opus.SIGNAL_VOICE),
+                (opus.api.ctl.set_inband_fec, 1),
+                (opus.api.ctl.set_packet_loss_perc, VOICE_LOSS)):
+                opus.api.encoder.encoder_ctl(self.encoder.encoder_state, ctl,
+                    value)
+        except self.error as e:
+            raise GospelError("cannot set up opus: %s" % e)
+
+    def encode(self, pcm):
+        try:
+            return self.encode_raw(self.encoder.encoder_state, pcm,
+                VOICE_SAMPLES, VOICE_OPUS_MAX)
+        except self.error:
+            return None
+
+    def decode(self, opus, fec=False):
+        """A frame of audio, fec being the one before opus rebuilt from it."""
+
+        try:
+            pcm = self.decoder.decode(opus, VOICE_SAMPLES, decode_fec=fec)
+        except self.error:
+            return None
+
+        return pcm if len(pcm) == VOICE_BYTES else None
+
+    def conceal(self):
+        """Something to play in place of a frame that never came."""
+
+        try:
+            pcm = self.decode_raw(self.decoder.decoder_state, None, 0,
+                VOICE_SAMPLES, False, channels=1)
+        except self.error:
+            return None
+
+        return pcm if len(pcm) == VOICE_BYTES else None
+
+
+class Call(_Link):
+    """
+    A voice call with one peer. You get one from GospelChat.call() or from a
+    hook, audio goes in and comes out as 16 bit signed mono PCM at 48 kHz.
+
+    Once it is talking a call sends fifty frames a second whatever you do, so
+    the other side sees a live call: send_audio() if you have something to
+    say and silence if you do not.
+
+    Attributes:
+        peer        the Peer at the other end
+        incoming    whether it called us
+        state       connecting, ringing, online, talking, hanging up or ended
+        reason      why it ended: local, remote, timeout or error
+        talking     when audio first arrived, in milliseconds, 0 before that
+        rx_frames   how many frames of audio arrived
+        tx_frames   how many frames of audio left
+    """
+
+    VERIFY = CALL_P2P_VERIFY
+
+    def __init__(self, chat, peer, mode, addr):
+        codec = _Codec()
+
+        super().__init__(chat, addr, min(chat.mtu, CALL_MTU_MAX))
+
+        self.peer = peer
+        self.incoming = mode == CALL_RING
+        self.reason = None
+        self.talking = 0
+        self.rx_frames = 0
+        self.tx_frames = 0
+        self.serial = 0
+
+        self._mode = mode
+        self._codec = codec
+        self._audio = bytearray()
+        self._tx_seq = 0
+        self._rx_seq = 0
+        self._started = _ms()
+        self._declined = 0
+        self._next_frame = 0
+        self._next_hangup = 0
+        self._ending = None
+
+    def __repr__(self):
+        return "Call(%02x, %s)" % (self.peer.id, self.state)
+
+    @property
+    def state(self):
+        if self.closed:
+            return "ended"
+
+        if self._mode == CALL_DECLINE:
+            return "hanging up"
+
+        if self.talking:
+            return "talking"
+
+        if not self.online:
+            return "connecting"
+
+        return "ringing" if self._mode == CALL_RING else "online"
+
+    @property
+    def link(self):
+        return "relay" if self.relay else "p2p"
+
+    @property
+    def queued(self):
+        """The milliseconds of audio still waiting for their turn."""
+
+        return len(self._audio) * VOICE_INTERVAL // VOICE_BYTES
+
+    def answer(self):
+        """Pick up a call that is ringing."""
+
+        if self.closed or self._ending or self._mode != CALL_RING:
+            raise GospelError("this call is not ringing")
+
+        self._mode = CALL_ANSWER
+
+    def hangup(self):
+        """End the call, or decline it if it is still ringing."""
+
+        if self.closed or self._ending or self._mode == CALL_DECLINE:
+            return
+
+        now = _ms()
+
+        if self._mode != CALL_RING:
+            self._send_hangups()
+            self._next_hangup = now + CALL_HANGUP_NEXT
+
+        self._declined = now
+        self._mode = CALL_DECLINE
+
+    def send_audio(self, pcm):
+        """
+        Queue audio to be sent, of any length. A chunk that does not fill its
+        last frame leaves that part waiting for the next chunk. This takes
+        five minutes at most, so a long answer is fed in as queued goes down.
+        """
+
+        if self.closed or self._mode == CALL_DECLINE:
+            return
+
+        if len(pcm) % 2:
+            raise GospelError("audio is 16 bit, this is half a sample short")
+
+        if len(self._audio) + len(pcm) > CALL_AUDIO_MAX:
+            raise GospelError("too much audio is waiting already")
+
+        self._audio += pcm
+
+    def clear_audio(self):
+        """Forget what has not been sent, for when we get interrupted."""
+
+        del self._audio[:]
+
+    def configure(self):
+        self.ctx.cathedral_configure(**self.chat._cathedral_cfg(
+            self, (self.chat.spi << TUNNEL_SHIFT) | self.peer.id,
+            0, self.chat.flock | CALL_DOMAIN, False, self.hops()))
+
+    def went_online(self):
+        if self._mode == CALL_RING:
+            self.chat._emit("on_call_ring", self)
+
+    def wants_signal(self):
+        return self._mode == CALL_DIAL
+
+    def manage(self):
+        now = _ms()
+
+        if self._ending is not None:
+            return
+
+        self.upkeep(now)
+        self._timeouts(now)
+
+        if self._ending is None:
+            self._pump(now)
+
+    @property
+    def ending(self):
+        """Why this call is over, once it is, for the chat to act on."""
+
+        return self._ending
+
+    def abort(self, reason):
+        self._send_hangups()
+        self._ending = reason
+
+    def close(self):
+        if self.closed:
+            return
+
+        self.closed = True
+        self.chat._forget(self)
+
+    def on_frame(self, buf):
+        self.last_rx = _ms()
+
+        if self._ending is not None:
+            return
+
+        frame = voice_unpack(buf)
+
+        if frame is None:
+            return
+
+        vtype, seq, opus = frame
+
+        if vtype == VOICE_HANGUP:
+            self._ending = "remote"
+        elif vtype == VOICE_AUDIO and self.online and \
+            self._mode in (CALL_DIAL, CALL_ANSWER):
+            self._on_audio(seq, opus)
+
+    def _on_audio(self, seq, opus):
+        self.rx_frames += 1
+
+        if not self.talking:
+            self.talking = _ms()
+            self.chat._emit("on_call_talking", self)
+
+        gap = 0
+
+        if seq != 0:
+            if self._rx_seq != 0:
+                gap = (seq - self._rx_seq) & 0xffff
+
+                # Overtaken by those after it, too late to play.
+                if gap == 0 or gap >= 0x8000:
+                    return
+
+            self._rx_seq = seq
+
+        if gap > 2:
+            self._play(self._codec.conceal())
+
+        if gap > 1:
+            self._play(self._codec.decode(opus, fec=True))
+
+        self._play(self._codec.decode(opus))
+
+    def _play(self, pcm):
+        if pcm is not None:
+            self.chat._emit("on_call_audio", self, pcm)
+
+    def _send_hangups(self):
+        if not self.online:
+            return
+
+        for _ in range(CALL_HANGUPS):
+            self.send_frame(voice_pack(VOICE_HANGUP))
+
+    def _timeouts(self, now):
+        since = now - self._started
+
+        if self._mode == CALL_DECLINE:
+            if self.online and now >= self._next_hangup:
+                self._next_hangup = now + CALL_HANGUP_NEXT
+                self._send_hangups()
+
+            if self.online:
+                if now - max(self.online, self._declined) >= CALL_LINGER:
+                    self._ending = "local"
+            elif now - self._declined >= CALL_DECLINE_MAX:
+                self._ending = "local"
+
+            return
+
+        if not self.online:
+            if since >= CALL_GRACE and not self.chat._call_signaled(self):
+                self._ending = "remote"
+            elif self.incoming and since >= CALL_RING_VERIFY:
+                self._ending = "timeout"
+
+        if self.talking:
+            if now - self.last_rx >= CALL_RX_TIMEOUT:
+                self._ending = "timeout"
+        elif since >= CALL_CONNECT:
+            self._ending = "timeout"
+
+    def _pump(self, now):
+        """Keep the stream going at its pace, catching up after a stall."""
+
+        if not self.online or (self._mode != CALL_ANSWER and
+            not self.talking):
+            self._next_frame = 0
+            return
+
+        if self._next_frame == 0 or \
+            now - self._next_frame > VOICE_INTERVAL * CALL_CATCHUP:
+            self._next_frame = now
+
+        while now >= self._next_frame:
+            self._next_frame += VOICE_INTERVAL
+            self._send_audio()
+
+    def _send_audio(self):
+        if len(self._audio) >= VOICE_BYTES:
+            pcm = bytes(self._audio[:VOICE_BYTES])
+            del self._audio[:VOICE_BYTES]
+        else:
+            pcm = VOICE_SILENCE
+
+        opus = self._codec.encode(pcm)
+
+        if opus is None:
+            return
+
+        self._tx_seq = self._tx_seq % 0xffff + 1
+        self.send_frame(voice_pack(VOICE_AUDIO, self._tx_seq, opus))
+        self.tx_frames += 1
+
+
 class GospelChat:
     """
-    A gospel chat: text both ways, images out, and data in with take_data.
+    A gospel chat: text both ways, images out, data in with take_data, and
+    voice calls, which ring here with take_calls.
 
     Arguments:
         config      a GospelConfig, the path to a Vigil configuration file,
@@ -2011,7 +2471,10 @@ class GospelChat:
         discoverable
                     show up as a peer on Vigil devices using the same
                     `liturgy_group` as our configuration. Vigil also shows
-                    those peers as callable, and we answer no call.
+                    those peers as callable, only take_calls answers that.
+                    The devices there are in the callable attribute.
+        take_calls  let devices call us, through on_call_ring. Needs opuslib,
+                    as does call().
 
     Hooks, either overridden in a subclass or assigned as plain functions:
 
@@ -2028,11 +2491,17 @@ class GospelChat:
         on_joined(peer)                 a peer joined our group
         on_left(peer)                   a peer left our group
         on_offline()                    the cathedral stopped answering
+        on_call_ring(call)              a peer proved it is calling us, it
+                                        rings until you answer() or hangup()
+        on_call_talking(call)           the first audio of a call arrived
+        on_call_audio(call, pcm)        20 ms of audio, on the clock of the
+                                        peer. Do not block in this one.
+        on_call_end(call, reason)       a call is over, see Call.reason
     """
 
     def __init__(self, config, nickname="", group=None, auto_ack=True,
         p2p=None, cathedrals=None, signal_all=False, features=None,
-        discoverable=False, take_data=False):
+        discoverable=False, take_data=False, take_calls=False):
         if isinstance(config, GospelConfig):
             cfg = config
         elif isinstance(config, (bytes, bytearray)) or "\n" in str(config):
@@ -2088,6 +2557,10 @@ class GospelChat:
         self.signaling = None
         self.discovery = None
         self.presence = None
+        self.call_signaling = None
+        self.callable = set()
+        self.active_call = None
+        self.take_calls = take_calls
         self.group = 0
         self.tallies = []
         self.rx = 0
@@ -2096,6 +2569,8 @@ class GospelChat:
         self._refs = 0
         self._tokens = 0
         self._switch = 0
+        self._call_serial = os.urandom(1)[0]
+        self._callers = {}
         self._selector = selectors.DefaultSelector()
         self._owners = {}
         self._running = True
@@ -2113,6 +2588,10 @@ class GospelChat:
             self.presence = _Liturgy(self, cfg.group + 1, False, CALL_DOMAIN)
             self.presence.configure()
             self.presence.poll_all()
+
+        if take_calls:
+            _opus()
+            self._call_liturgy()
 
         # liturgy_group in a Vigil configuration is what calls signal in,
         # chats start in no group.
@@ -2146,6 +2625,30 @@ class GospelChat:
         self._signal()
 
         return self._message_of(held, peer, None)
+
+    def call(self, peer):
+        """
+        Call the device with the given id and return the Call, which lives
+        until on_call_end. There is one call at a time.
+        """
+
+        self._check_peer(peer)
+
+        if peer == self.spi:
+            raise GospelError("a device cannot call itself")
+
+        if self.active_call is not None:
+            raise GospelError("already on a call with %02x"
+                % self.active_call.peer.id)
+
+        self._call_liturgy()
+
+        call = self._call_open(peer, CALL_DIAL)
+
+        self._call_serial = self._call_serial % 255 + 1
+        call.serial = self._call_serial
+
+        return call
 
     def reply(self, peer, text, to, ref=None):
         """
@@ -2483,6 +2986,12 @@ class GospelChat:
             "present": sum(1 for p in self.peers.values() if p.present),
             "members": sum(1 for p in self.peers.values() if p.member),
             "held": sum(len(p.outbox) for p in self.peers.values()),
+            "callable": sorted("%02x" % p for p in self.callable),
+            "call": None if self.active_call is None else {
+                "peer": "%02x" % self.active_call.peer.id,
+                "state": self.active_call.state,
+                "link": self.active_call.link,
+            },
             "rx": self.rx,
             "tx": self.tx,
         }
@@ -2503,7 +3012,8 @@ class GospelChat:
 
         now = _ms()
 
-        for lit in (self.signaling, self.discovery, self.presence):
+        for lit in (self.signaling, self.discovery, self.presence,
+            self.call_signaling):
             if lit is None:
                 continue
 
@@ -2534,6 +3044,7 @@ class GospelChat:
 
         self._tallies_report()
         self._signal()
+        self._calls(now)
 
     def add_reader(self, fd, callback):
         """
@@ -2597,6 +3108,14 @@ class GospelChat:
 
         self._closing = True
         self._running = False
+
+        if self.active_call is not None:
+            self.active_call.abort("local")
+            self._call_finish(self.active_call)
+
+        if self.call_signaling is not None:
+            self.call_signaling.close()
+            self.call_signaling = None
 
         for target in list(self.peers.values()):
             for tunnel in (target.signal_tunnel, target.group_tunnel):
@@ -2666,6 +3185,18 @@ class GospelChat:
     def on_offline(self):
         pass
 
+    def on_call_ring(self, call):
+        pass
+
+    def on_call_talking(self, call):
+        pass
+
+    def on_call_audio(self, call, pcm):
+        pass
+
+    def on_call_end(self, call, reason):
+        pass
+
     #
     # Plumbing: contexts, sockets, and the callbacks they call us on.
     #
@@ -2677,7 +3208,7 @@ class GospelChat:
 
         return sock
 
-    def _new_context(self, owner, kek):
+    def _new_context(self, owner, kek, mtu=None):
         ctx = libkyrka.alloc()
 
         self._owners[id(ctx)] = owner
@@ -2685,7 +3216,7 @@ class GospelChat:
         if self.shroud:
             ctx.shroud_enable()
 
-        ctx.mtu_size(self.mtu)
+        ctx.mtu_size(mtu or self.mtu)
         ctx.event_callback(self._event, None)
         ctx.heaven_callback(self._heaven, owner)
         ctx.purgatory_callback(self._purgatory, owner)
@@ -2752,7 +3283,7 @@ class GospelChat:
             self.rx += len(data)
             owner.source = from_addr
 
-            if isinstance(owner, _Tunnel):
+            if isinstance(owner, _Link):
                 if from_addr == owner.cathedral.addr:
                     owner.cathedral.last = _ms()
                     owner.cathedral.alive = True
@@ -2769,7 +3300,7 @@ class GospelChat:
                 owner.alive = True
 
             shroud = libkyrka.KYRKA_PACKET_SHROUD_PEER \
-                if isinstance(owner, _Tunnel) and \
+                if isinstance(owner, _Link) and \
                 from_addr != owner.cathedral.addr else \
                 libkyrka.KYRKA_PACKET_SHROUD_CATHEDRAL
 
@@ -2781,7 +3312,7 @@ class GospelChat:
         return self._tokens
 
     def _heaven(self, ctx, data, seq, owner):
-        if isinstance(owner, _Tunnel):
+        if isinstance(owner, _Link):
             owner.on_frame(data)
 
     def _purgatory(self, ctx, data, seq, owner):
@@ -2815,6 +3346,11 @@ class GospelChat:
                 self._present(peers)
             elif lit is self.discovery:
                 self._members(peers)
+            elif lit is self.call_signaling:
+                self._call_push(peers)
+            elif lit is self.presence:
+                self.callable = set(id for id in range(1, PEERS_PER_FLOCK)
+                    if peers[id] and id != self.spi)
         elif event == libkyrka.KYRKA_EVENT_REMEMBRANCE_RECEIVED:
             self._more_cathedrals(info.get("cathedrals") or [])
 
@@ -2826,7 +3362,7 @@ class GospelChat:
             tun.online = _ms()
             tun.last_rx = _ms()
             tun.next_notify = 0
-            self._emit("on_peer", tun.peer)
+            tun.went_online()
         elif event == libkyrka.KYRKA_EVENT_KEYS_ERASED:
             tun.p2p_verify = 0
             tun.addr = tun.cathedral.addr
@@ -2868,7 +3404,7 @@ class GospelChat:
             return
 
         tun.p2p_rx = _ms()
-        tun.p2p_verify = _ms() + P2P_VERIFY
+        tun.p2p_verify = _ms() + tun.VERIFY
         tun.holepunch = _ms() + HOLEPUNCH
         tun.next_heartbeat = _ms()
         self._p2p_active(tun.ctx, 1)
@@ -3014,7 +3550,10 @@ class GospelChat:
         return 0
 
     def _busy(self):
-        """Whether data is on its way to or from one of our peers."""
+        """Whether data or a call is on its way to or from one of our peers."""
+
+        if self.active_call is not None:
+            return True
 
         for target in self.peers.values():
             for tunnel in (target.signal_tunnel, target.group_tunnel):
@@ -3095,6 +3634,102 @@ class GospelChat:
 
             if addr not in self.cathedrals:
                 self.cathedrals.append(addr)
+
+    #
+    # Calls.
+    #
+
+    def _call_liturgy(self):
+        """The liturgy calls signal in, which a Vigil has from the start."""
+
+        if self.call_signaling is None:
+            self.call_signaling = _Liturgy(self, self.config.group, True,
+                CALL_DOMAIN)
+            self.call_signaling.configure()
+
+        return self.call_signaling
+
+    def _call_open(self, peer, mode):
+        call = Call(self, self.peer(peer), mode,
+            self.call_signaling.cathedral.addr)
+        call.configure()
+
+        self.active_call = call
+
+        return call
+
+    def _call_push(self, peers):
+        """The cathedral pushes each peer signaling us, with its call."""
+
+        now = _ms()
+
+        for id in range(1, PEERS_PER_FLOCK):
+            if id == self.spi or not peers[id]:
+                continue
+
+            seen = self._callers.setdefault(id, [0, 0, 0])
+            seen[0] = peers[id]
+            seen[1] = now
+
+    def _call_signaled(self, call):
+        """Whether the signaling still says there is a call with this peer."""
+
+        return call.wants_signal() or call.peer.id in self._callers
+
+    def _calls(self, now):
+        """Who is calling, the call we are on, what the cathedral hears."""
+
+        lit = self.call_signaling
+
+        if lit is None:
+            return
+
+        for id, seen in list(self._callers.items()):
+            if now - seen[1] >= PRESENT_EXPIRE:
+                del self._callers[id]
+
+        if self.take_calls and self.active_call is None:
+            self._call_incoming()
+
+        call = self.active_call
+
+        if call is not None:
+            call.manage()
+
+            if call.ending is not None:
+                self._call_finish(call)
+
+        call = self.active_call
+        want = bytearray(PEERS_PER_FLOCK)
+
+        if call is not None and call.wants_signal():
+            want[call.peer.id] = call.serial
+
+        lit.signal(want)
+
+    def _call_incoming(self):
+        """Start on a call we have not dealt with yet, the first in line."""
+
+        for id, seen in self._callers.items():
+            if seen[0] != seen[2]:
+                self._call_open(id, CALL_RING)
+                return
+
+    def _call_finish(self, call):
+        """It is over: whatever serial it signals now is not a new call."""
+
+        seen = self._callers.get(call.peer.id)
+
+        if seen is not None:
+            seen[2] = seen[0]
+
+        call.reason = call.ending
+        call.close()
+
+        if self.active_call is call:
+            self.active_call = None
+
+        self._emit("on_call_end", call, call.reason)
 
     #
     # Tallies.

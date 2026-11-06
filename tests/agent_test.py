@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "src"))
 sys.path.insert(0, os.path.join(HERE, "..", "examples"))
 
 import fakekyrka  # noqa: E402
+import fakeopus  # noqa: E402
 
 sys.modules["libkyrka"] = fakekyrka.Module(fakekyrka.Network())
 
@@ -137,6 +138,7 @@ class Quiet(agent.ClaudeAgent):
 def opts(tmp, **kwargs):
     fields = dict(claude="claude", dir="/work", model=None, idle=900,
         max_out=4096, progress=False, stats=0, transcribe=None, render=None,
+        hear=None, speak=None, signal_all=False, liturgy=None, group=None,
         inbox=os.path.join(tmp, "inbox"),
         sessions=os.path.join(tmp, "state", "sessions.json"))
     fields.update(kwargs)
@@ -1364,6 +1366,588 @@ def script(tmp, body):
     os.chmod(path, 0o700)
 
     return path
+
+
+class Line:
+    """A child of a call, as far as a Voice can tell."""
+
+    def __init__(self):
+        self.wrote = []
+        self.gone = False
+        self.closed = False
+
+    def write(self, data, droppable=False):
+        self.wrote.append(data)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+class Phone:
+    """A pygospel.Call, as far as a Voice can tell."""
+
+    def __init__(self, state="ringing"):
+        self.state = state
+        self.peer = types.SimpleNamespace(id=0x02)
+        self.queued = 0
+        self.audio = []
+        self.hung_up = 0
+
+    def answer(self):
+        self.state = "talking"
+
+    def hangup(self):
+        self.hung_up += 1
+
+    def send_audio(self, pcm):
+        self.audio.append(pcm)
+        self.queued += len(pcm) * 20 // 1920
+
+    def clear_audio(self):
+        self.audio = []
+        self.queued = 0
+
+
+class CallChat:
+    spi = 0x07
+    group = 0
+    working_sound = b"tick"
+
+    def __init__(self):
+        self.prompts = []
+        self.said = []
+        self.conv = types.SimpleNamespace(voice=None, busy=False,
+            running=None)
+
+    def conversation(self, msg):
+        return self.conv
+
+    def on_message(self, msg):
+        self.prompts.append(msg.text)
+
+    def send(self, peer, text):
+        self.said.append(text)
+
+
+def line_up(state="talking"):
+    """A Voice with both of its children loaded."""
+
+    chat = CallChat()
+    call = Phone(state)
+    voice = agent.Voice(chat, call, None, Line(), Line())
+
+    voice.on_heard(b'{"ready": true}\n')
+    voice.on_spoken(agent.VOICE_HEAD.pack(0, 0))
+
+    return chat, call, voice
+
+
+def spoken(voice):
+    return [json.loads(line)["text"] for line in voice.speak.wrote]
+
+
+def say_out(voice, ms=1000):
+    """The child that speaks gets through what it was asked to say."""
+
+    while voice.saying is not None:
+        id = voice.saying[0]
+        voice.on_spoken(agent.VOICE_HEAD.pack(id, ms * 96) + bytes(ms * 96) +
+            agent.VOICE_HEAD.pack(id, 0))
+
+
+def test_speakable():
+    check("markdown goes", agent.speakable("**Done**, see `x`"), "Done, see x")
+    check("a list marker goes", agent.speakable("- one thing"), "one thing")
+    check("a number too", agent.speakable("2. two things"), "two things")
+    check("a heading too", agent.speakable("## Results"), "Results")
+    check("a link is its words", agent.speakable("[the docs](http://a.b/c)"),
+        "the docs")
+    check("a bare url", agent.speakable("at http://a.b/c ok"), "at a link ok")
+    check("an image is not said", agent.speakable("[image: cat.png]\n"), "")
+    check("nothing to say", agent.speakable("---"), "")
+
+
+def test_call_answers_once_both_are_loaded():
+    chat = CallChat()
+    call = Phone()
+    voice = agent.Voice(chat, call, None, Line(), Line())
+
+    voice.on_heard(b'{"ready": true}\n')
+    check("still loading the other", call.state, "ringing")
+
+    voice.on_spoken(agent.VOICE_HEAD.pack(0, 0))
+    check("picks up", call.state, "talking")
+
+
+def test_call_loading_too_long_hangs_up():
+    chat = CallChat()
+    call = Phone()
+    voice = agent.Voice(chat, call, None, Line(), Line())
+
+    voice.tick(voice.deadline - 1)
+    check("still ringing", call.hung_up, 0)
+
+    voice.tick(voice.deadline + 1)
+    check("hung up", call.hung_up, 1)
+    ok("and said why", "load" in chat.said[0])
+
+    voice.tick(voice.deadline + 2)
+    check("only once", (call.hung_up, len(chat.said)), (1, 1))
+
+
+def test_call_child_dying_hangs_up():
+    chat, call, voice = line_up()
+
+    voice.hear.gone = True
+
+    for _ in range(3):
+        voice.tick(1)
+
+    check("hung up once", call.hung_up, 1)
+    check("told once", len(chat.said), 1)
+    ok("named it", "listener" in chat.said[0])
+
+
+def test_call_words_become_a_marked_prompt():
+    chat, call, voice = line_up()
+
+    voice.on_heard(b'{"speech": true}\n{"text": " how is it going "}\n')
+
+    check("one prompt", len(chat.prompts), 1)
+    ok("marked", chat.prompts[0].startswith(agent.TRANSCRIPTS))
+    ok("has the words", chat.prompts[0].endswith("how is it going"))
+    ok("told it is a call", "short plain sentences" in chat.prompts[0])
+    check("hooked to the agent", chat.conv.voice, voice)
+    check("listening stops", voice.listening, False)
+
+    voice.on_heard(b'{"text": ""}\n{"text": " ... "}\n')
+    check("noise is no prompt", len(chat.prompts), 1)
+
+
+def test_call_prompt_quotes_nothing():
+    chat = CallChat()
+    seen = []
+    chat.on_message = seen.append
+    voice = agent.Voice(chat, Phone(), None, Line(), Line())
+
+    voice.on_heard(b'{"text": "hello"}\n')
+
+    check("no hash to quote", seen[0].hash, 0)
+    check("from the peer", (seen[0].peer, seen[0].author), (2, 2))
+    check("not a group", seen[0].group, None)
+
+
+def test_call_sentences_are_said_one_at_a_time():
+    chat, call, voice = line_up()
+
+    voice.add("First one. Sec")
+    check("whole sentences only", spoken(voice), ["First one."])
+
+    voice.add("ond one! And third")
+    check("waits its turn", spoken(voice), ["First one."])
+
+    say_out(voice)
+    check("then the next", spoken(voice), ["First one.", "Second one!"])
+
+    say_out(voice)
+    voice.finish_turn()
+    check("the end is a sentence too", spoken(voice)[-1], "And third")
+    say_out(voice)
+    check("audio reached the call", len(call.audio), 3)
+
+
+def test_call_code_is_not_read_out():
+    chat, call, voice = line_up()
+
+    voice.add("Here it is:\n```python\nprint('secret')\n")
+    voice.add("x = 1.\nmore()\n```\nThat is all.\n")
+
+    for _ in range(5):
+        say_out(voice)
+
+    voice.finish_turn()
+    say_out(voice)
+
+    said = " ".join(spoken(voice))
+
+    ok("no code", "print" not in said and "x = 1" not in said)
+    ok("says where it is", agent.VOICE_CODE in said)
+    ok("carries on after", "That is all." in said)
+
+
+def test_call_long_answer_is_cut_short():
+    chat, call, voice = line_up()
+
+    for n in range(100):
+        voice.add("Sentence number %d is here to take up some room. " % n)
+        say_out(voice)
+
+    said = spoken(voice)
+
+    ok("well short of all of it", len(said) < 40)
+    check("says so at the end", said[-1], agent.VOICE_REST)
+
+    voice.finish_turn()
+    voice.add("A new turn. ")
+    say_out(voice)
+    check("the next turn gets to talk", spoken(voice)[-1], "A new turn.")
+
+
+def test_call_talking_over_stops_it():
+    chat, call, voice = line_up()
+    voice.turns.append(chat.conv)
+    chat.conv.busy = True
+    chat.conv.running = chat.conv
+    voice.agent = chat.conv
+
+    voice.add("One is heard. ")
+    say_out(voice, ms=1000)
+    voice.add("Two is not. ")
+    say_out(voice, ms=1000)
+
+    call.queued = 1000
+
+    voice.on_heard(b'{"speech": true}\n')
+
+    check("audio is gone", call.queued, 0)
+    check("nothing else is said", voice.lines, [])
+
+    before = len(spoken(voice))
+
+    voice.add("This streams in afterwards. ")
+    check("the rest of this turn stays quiet", len(spoken(voice)), before)
+
+    voice.on_heard(b'{"text": "hold on"}\n')
+
+    ok("the agent knows what was heard",
+        'heard you up to: "One is heard."' in chat.prompts[0])
+    ok("still marked", chat.prompts[0].startswith(agent.TRANSCRIPTS))
+    ok("and what they said", chat.prompts[0].endswith("hold on"))
+
+    voice.finish_turn()
+    voice.add("The next answer. ")
+    check("the next turn talks again", spoken(voice)[-1], "The next answer.")
+
+
+def test_call_interrupted_after_turn_still_talks_next():
+    chat, call, voice = line_up()
+
+    voice.add("Done now. ")
+    say_out(voice)
+    call.queued = 500
+
+    voice.on_heard(b'{"speech": true}\n{"text": "thanks"}\n')
+
+    voice.add("You are welcome. ")
+    check("not left hushed", spoken(voice)[-1], "You are welcome.")
+
+
+def test_call_stale_audio_is_not_played():
+    chat, call, voice = line_up()
+
+    voice.add("Old sentence. ")
+
+    old = voice.saying[0]
+
+    voice.on_heard(b'{"speech": true}\n')
+    voice.on_spoken(agent.VOICE_HEAD.pack(old, 4) + b"late" +
+        agent.VOICE_HEAD.pack(old, 0))
+
+    check("dropped", call.audio, [])
+
+
+def test_call_split_chunks_reassemble():
+    chat, call, voice = line_up()
+
+    voice.add("Split up. ")
+
+    id = voice.saying[0]
+    data = agent.VOICE_HEAD.pack(id, 4) + b"abcd" + \
+        agent.VOICE_HEAD.pack(id, 0)
+
+    for n in range(len(data)):
+        voice.on_spoken(data[n:n + 1])
+
+    check("whole", call.audio[0], b"abcd")
+    check("done", voice.saying, None)
+
+
+def test_call_sentence_ends_on_a_whole_frame():
+    chat, call, voice = line_up()
+
+    voice.add("Short. ")
+
+    id = voice.saying[0]
+
+    voice.on_spoken(agent.VOICE_HEAD.pack(id, 1000) + bytes(1000) +
+        agent.VOICE_HEAD.pack(id, 0))
+
+    check("padded to a frame", sum(len(pcm) for pcm in call.audio), 1920)
+
+    call.queued = 0
+    voice.on_heard(b'{"speech": true}\n{"text": "a question"}\n')
+
+    ok("nothing was cut off", "cut off" not in chat.prompts[0])
+
+
+def test_call_working_sound():
+    chat, call, voice = line_up()
+
+    voice.tick(100)
+    check("quiet when nothing runs", call.audio, [])
+
+    voice.turns.append(chat.conv)
+    voice.agent = chat.conv
+    chat.conv.busy = True
+    chat.conv.running = chat.conv
+
+    voice.tick(100)
+    check("a sound while it works", call.audio, [b"tick"])
+
+    call.queued = 0
+    voice.tick(101)
+    check("not all the time", len(call.audio), 1)
+
+    voice.tick(100 + agent.WORKING_EVERY)
+    check("every so often", len(call.audio), 2)
+
+    voice.listening = True
+    call.queued = 0
+    voice.tick(100 + agent.WORKING_EVERY * 2)
+    check("not over them", len(call.audio), 2)
+
+
+def voiced(backend, tmp):
+    """An agent of the given backend whose turn came from a call."""
+
+    chat = Chat()
+    one = backend(chat, "p02", opts(tmp))
+
+    voice = types.SimpleNamespace(added=[], notes=[], finished=0)
+    voice.owns = lambda msg: msg is not None and msg.text.startswith("(voice")
+    voice.add = voice.added.append
+    voice.note = voice.notes.append
+
+    def finish_turn():
+        voice.finished += 1
+
+    voice.finish_turn = finish_turn
+    one.voice = voice
+
+    return chat, one, voice
+
+
+class QuietPi(agent.PiAgent):
+    def start(self):
+        self.proc = Proc()
+
+
+def test_call_streams_from_claude():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one, voice = voiced(Quiet, tmp)
+
+        ok("asks for partial messages",
+            "--include-partial-messages" in one.starts[0])
+
+        one.dispatch({"type": "system", "subtype": "init", "session_id": "s"})
+        one.begin(message("(voice call, transcribed, x) hi"))
+
+        one.dispatch({"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "Hel"}}})
+        one.dispatch({"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "thinking_delta", "thinking": "hmm"}}})
+        one.dispatch({"type": "stream_event", "parent_tool_use_id": "t",
+            "event": {"type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "subagent"}}})
+        one.dispatch({"type": "stream_event", "event": {
+            "type": "content_block_delta",
+            "delta": {"type": "text_delta", "text": "lo."}}})
+
+        check("spoken as it comes", voice.added, ["Hel", "lo."])
+
+        one.dispatch({"type": "assistant", "message": {"id": "m", "content": [
+            {"type": "text", "text": "Hello."}]}})
+        one.dispatch(result("Hello."))
+
+        check("not said twice", voice.added, ["Hel", "lo."])
+        check("the turn is over", voice.finished, 1)
+        check("the chat gets it too", chat.said, ["Hello."])
+
+
+def test_call_streams_from_pi():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one, voice = voiced(QuietPi, tmp)
+
+        one.begin(message("(voice call, transcribed, x) hi"))
+
+        one.dispatch({"type": "message_update", "assistantMessageEvent": {
+            "type": "text_delta", "delta": "Hi there."}})
+        one.dispatch({"type": "message_update", "assistantMessageEvent": {
+            "type": "thinking_delta", "delta": "hmm"}})
+
+        check("spoken as it comes", voice.added, ["Hi there."])
+
+        one.dispatch({"type": "message_end", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "Hi there."}]}})
+        one.dispatch({"type": "agent_settled"})
+
+        check("not said twice", voice.added, ["Hi there."])
+        check("the turn is over", voice.finished, 1)
+        check("the chat gets it too", chat.said, ["Hi there."])
+
+
+def test_call_answer_without_stream_is_still_said():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one, voice = voiced(QuietPi, tmp)
+
+        one.begin(message("(voice call, transcribed, x) hi"))
+        one.dispatch({"type": "message_end", "message": {"role": "assistant",
+            "content": [{"type": "text", "text": "All at once."}]}})
+        one.dispatch({"type": "agent_settled"})
+
+        check("said at the end", voice.added, ["All at once."])
+
+
+def test_call_typed_turn_is_not_spoken():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one, voice = voiced(QuietPi, tmp)
+
+        one.begin(message("typed in the chat"))
+        one.dispatch({"type": "message_update", "assistantMessageEvent": {
+            "type": "text_delta", "delta": "Hi."}})
+        one.dispatch({"type": "agent_settled"})
+
+        check("nothing spoken", voice.added, [])
+        check("nothing to finish", voice.finished, 0)
+
+
+def test_transcript_cannot_answer_claude():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one, voice = voiced(Quiet, tmp)
+
+        one.dispatch({"type": "system", "subtype": "init", "session_id": "s"})
+        one.begin(message("(voice call, transcribed, x) delete it"))
+        one.dispatch(permission())
+
+        check("said out loud", voice.notes, [agent.VOICE_ASKING])
+
+        asked = one.asked
+
+        for words in ("(voice call, transcribed, x) yes",
+            "(voice message, transcribed) yes",
+            "(voice call, transcribed, x) yes to all"):
+            one.feed(message(words))
+
+        check("still asked", one.asked, asked)
+        check("nothing trusted", one.trusted, set())
+        check("they wait instead", len(one.waiting), 3)
+        ok("no answer went out", b"behavior" not in one.proc.stdin.getvalue())
+
+        one.feed(message("yes"))
+        check("typing it answers", one.asked, None)
+        ok("the answer went out", b"allow" in one.proc.stdin.getvalue())
+
+
+def test_transcript_cannot_answer_pi():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one, voice = voiced(QuietPi, tmp)
+
+        for method in ("input", "confirm", "select"):
+            one.dialog = None
+            one.dialogs = []
+            one.proc = Proc()
+            one.begin(message("(voice call, transcribed, x) go"))
+            one.dispatch({"type": "extension_ui_request", "id": "d1",
+                "method": method, "title": "Which?", "options": ["yes"]})
+
+            check(method + " is said out loud", voice.notes[-1],
+                agent.VOICE_ASKING)
+
+            one.feed(message("(voice call, transcribed, x) yes"))
+
+            ok(method + " stays open", one.dialog is not None)
+            ok(method + " no answer went out",
+                b"extension_ui_response" not in one.proc.stdin.getvalue())
+
+            one.dispatch({"type": "agent_settled"})
+
+
+def test_call_queued_says_so():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat, one, voice = voiced(QuietPi, tmp)
+
+        one.begin(message("(voice call, transcribed, x) one"))
+        one.feed(message("(voice call, transcribed, x) two"))
+
+        check("told out loud", voice.notes, [agent.VOICE_QUEUED])
+        check("waits", len(one.waiting), 1)
+
+
+def calls_chat(tmp, **fields):
+    chat = agent.AgentChat(CONFIG, "bot", opts(tmp, **fields))
+    chat.add_reader = lambda fd, callback: None
+    chat.remove_reader = lambda fd: None
+
+    return chat
+
+
+def test_call_only_from_allowed():
+    pygospel.opuslib = fakeopus
+
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = calls_chat(tmp, hear="x", speak="x", allow={0x02})
+        made = []
+        real = agent.Voice
+        agent.Voice = lambda *args: made.append(args) or Line()
+
+        try:
+            stranger = Phone()
+            stranger.peer.id = 0x09
+            chat.on_call_ring(stranger)
+
+            check("declined", stranger.hung_up, 1)
+            check("no models loaded for that", made, [])
+
+            friend = Phone()
+            chat.on_call_ring(friend)
+
+            check("not declined", friend.hung_up, 0)
+            check("models loading", len(made), 1)
+        finally:
+            agent.Voice = real
+            chat.voice = None
+            chat.close()
+
+
+def test_call_takes_no_calls_without_speech():
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = calls_chat(tmp)
+
+        check("no call liturgy", chat.call_signaling, None)
+        check("no calls", chat.take_calls, False)
+
+        chat.close()
+
+
+def test_call_cannot_start_speech():
+    pygospel.opuslib = fakeopus
+
+    with tempfile.TemporaryDirectory() as tmp:
+        chat = calls_chat(tmp, hear="/nonexistent/hear",
+            speak="/nonexistent/speak", allow=None)
+        call = Phone()
+
+        chat.on_call_ring(call)
+
+        check("hung up", call.hung_up, 1)
+        check("nothing left", chat.voice, None)
+
+        chat.close()
 
 
 def test_voice_becomes_a_prompt():

@@ -14,7 +14,8 @@ PYSITE?=$(shell $(PYTHON) -c \
 SRC=	src/pygospel.py
 TESTS=	tests/gospel_test.py tests/agent_test.py
 TOOLS=	examples/chatter.py examples/echo.py examples/presence.py \
-	examples/agent.py tools/transcribe.py tools/render.py
+	examples/agent.py examples/call.py tools/transcribe.py tools/render.py \
+	tools/hear.py tools/speak.py
 
 all: python-mod
 
@@ -27,6 +28,9 @@ install: all
 	install -m 644 $(SRC) $(DESTDIR)$(PYSITE)
 	install -m 555 $(PYMOD)/libkyrka.so $(DESTDIR)$(PYSITE)
 
+agent-requirements:
+	@PYTHON=$(PYTHON) ./dist-build/agent-requirements.sh
+
 test:
 	@for t in $(TESTS); do $(PYTHON) $$t || exit 1; done
 
@@ -35,9 +39,9 @@ smoke: python-mod
 
 lint:
 	@$(PYTHON) -m py_compile $(SRC) $(TESTS) tests/fakekyrka.py \
-	    tests/smoke.py $(TOOLS)
+	    tests/fakeopus.py tests/smoke.py $(TOOLS)
 	@$(PYTHON) tools/check-style.py $(SRC) $(TESTS) tests/fakekyrka.py \
-	    tests/smoke.py $(TOOLS)
+	    tests/fakeopus.py tests/smoke.py $(TOOLS)
 	@echo "python ok"
 
 cathedral:
@@ -59,5 +63,6 @@ clean:
 dist-clean: clean
 	rm -rf build
 
-.PHONY: all python-mod test smoke lint install cathedral cathedral-down
+.PHONY: all python-mod requirements test smoke lint install cathedral
+.PHONY: cathedral-down
 .PHONY: cathedral-status cathedral-e2e clean dist-clean

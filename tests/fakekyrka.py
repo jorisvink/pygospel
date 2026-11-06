@@ -282,16 +282,17 @@ class Context:
 
         kind = data[:1]
         flock, tunnel, group = HEAD.unpack_from(data, 1)
-        sender = self.net.by_tunnel(flock, tunnel, group)
-
-        if sender is None:
-            raise Error("KYRKA_ERROR_NO_RX_KEY")
 
         if kind == OFFER:
+            sender = self.net.by_tunnel(flock, tunnel, group)
+
+            if sender is None:
+                raise Error("KYRKA_ERROR_NO_RX_KEY")
+
             self.net.offer(sender, data[1 + HEAD.size:])
             return True
 
-        if not self.online:
+        if kind != PEER or not self.online:
             raise Error("KYRKA_ERROR_NO_RX_KEY")
 
         self.net.frames.append((self, len(data[1 + HEAD.size:])))
@@ -450,7 +451,7 @@ class Network:
             if id >= KYRKA_PEERS_PER_FLOCK or id == us:
                 continue
 
-            if ctx.group == 0:
+            if ctx.remembrance:
                 # A signaling liturgy lists who is interested in us.
                 if other.wanted is None:
                     present[id] = 1

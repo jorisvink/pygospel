@@ -26,16 +26,23 @@ answers it with yes or no, or with yes to all to stop being asked until /ask,
 Only the devices named in --allow are answered. What the agent can do is
 what a shell on this machine can do, and every other device in the flock
 could otherwise point it at something.
+
+With --hear and --speak those devices can also call it, see tools/hear.py and
+tools/speak.py. What they say is a prompt in the same conversation, the answer
+is spoken as it comes and still goes to the chat. A transcript cannot run a
+command or answer a question, so permission is still given by typing it.
 """
 
 import os
 import re
 import sys
 import json
+import math
 import time
 import uuid
 import shlex
 import shutil
+import struct
 import argparse
 import tempfile
 import subprocess
@@ -61,6 +68,31 @@ RENDER_MAX   = 600
 UNSENT_MAX   = 900
 IMAGE_LINE   = re.compile(r"^[ \t]*\[image:[ \t]*(.+?)[ \t]*\][ \t]*$", re.M)
 RENDER       = re.compile(r"^!render(?:\s+(.*))?$", re.I | re.S)
+TRANSCRIPTS  = ("(voice message, transcribed)", "(voice call, transcribed")
+
+# A call: how long its children get to load, how much audio may wait for the
+# one that listens in bytes, how much of an answer gets spoken in characters.
+VOICE_READY    = 45
+VOICE_BACKLOG  = 5 * 48000 * 2
+VOICE_SAY_MAX  = 1200
+VOICE_LINE_MAX = 200
+VOICE_PROMPT   = ("(voice call, transcribed, this is spoken to them as you "
+    "write it: short plain sentences, no code, lists or paths, and anything "
+    "long goes in a file) %s%s")
+VOICE_CUT      = "(you got cut off, they heard you up to: \"%s\") "
+VOICE_CUT_NONE = "(you got cut off before they heard any of that) "
+VOICE_ASKING   = "I need your approval for something, have a look at the chat."
+VOICE_QUEUED   = "I will get to that next."
+VOICE_REST     = "The rest is in the chat."
+VOICE_CODE     = "The code is in the chat."
+VOICE_HELLO    = "Yes?"
+VOICE_HEAD     = struct.Struct("!II")
+
+# The sound of an agent working, every so often, in seconds and samples.
+WORKING_EVERY = 4
+WORKING_HZ    = 660
+WORKING_LEVEL = 1200
+WORKING_LEN   = 48000 // 10
 
 # The session a child must not inherit: those describe whoever started this
 # program, not the run the child is having on its own.
@@ -192,6 +224,19 @@ def parse_ids(text):
     return ids
 
 
+def speakable(text):
+    """A piece of an answer the way it should sound, "" if it does not."""
+
+    text = IMAGE_LINE.sub("", text)
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    text = re.sub(r"https?://\S+", "a link", text)
+    text = re.sub(r"^[ \t]*(?:[-*+>]|\d+\.|#+)[ \t]+", "", text, flags=re.M)
+    text = re.sub(r"[*_`#]", "", text)
+    text = " ".join(text.split())
+
+    return text if any(c.isalnum() for c in text) else ""
+
+
 class Unsent(Exception):
     """A piece the chat would not take, and how many went before it."""
 
@@ -246,6 +291,8 @@ class Agent:
         self.tools = 0
         self.tool = None
         self.idle = time.monotonic()
+        self.voice = None
+        self.spoke = False
 
         self.start()
 
@@ -350,13 +397,15 @@ class Agent:
 
         self.idle = time.monotonic()
 
-        if self.answered(msg):
+        # Words we think we heard do not get to answer anything.
+        if not msg.text.startswith(TRANSCRIPTS) and self.answered(msg):
             return
 
         if self.busy:
             self.waiting.append(msg)
             self.tell(msg, "message queued (%d/%d pending)"
                 % (len(self.waiting), len(self.waiting)))
+            self.speak_note(VOICE_QUEUED, msg)
         else:
             self.begin(msg)
 
@@ -374,6 +423,7 @@ class Agent:
         self.tools = 0
         self.tool = None
         self.busy = True
+        self.spoke = False
         self.typing(True)
 
         if self.submit(msg):
@@ -390,6 +440,9 @@ class Agent:
 
     def finish(self):
         """This turn is over, the oldest message waiting gets the next one."""
+
+        if self.voice is not None and self.voice.owns(self.running):
+            self.voice.finish_turn()
 
         self.running = None
         self.busy = False
@@ -445,6 +498,20 @@ class Agent:
             return msg.text
 
         return "%s: %s" % (msg.where, msg.text)
+
+    def speak_text(self, text):
+        """Part of the answer, if the turn it belongs to came from a call."""
+
+        if text and self.voice is not None and \
+            self.voice.owns(self.running):
+            self.spoke = True
+            self.voice.add(text)
+
+    def speak_note(self, text, msg=None):
+        """Something to say that is not the answer, if this is a call."""
+
+        if self.voice is not None and self.voice.owns(msg or self.owner()):
+            self.voice.note(text)
 
     def typing(self, on):
         try:
@@ -549,6 +616,9 @@ class Agent:
         """The answer, quoted onto what it replies to and split to fit."""
 
         msg = self.owner()
+
+        if not self.spoke:
+            self.speak_text(text)
 
         images = IMAGE_LINE.findall(text)
         text = IMAGE_LINE.sub("", text).strip()
@@ -810,6 +880,11 @@ class PiAgent(Agent):
 
         if kind == "response":
             self.on_response(rec)
+        elif kind == "message_update":
+            update = rec.get("assistantMessageEvent") or {}
+
+            if update.get("type") == "text_delta":
+                self.speak_text(update.get("delta"))
         elif kind == "message_end":
             self.on_message_end(rec)
         elif kind == "tool_execution_start":
@@ -944,6 +1019,7 @@ class PiAgent(Agent):
 
         if self.dialog is not None:
             self.tell(self.owner(), self.dialog["question"])
+            self.speak_note(VOICE_ASKING)
 
     def drop_dialogs(self):
         """Tell pi nobody will answer, it stays blocked on them otherwise."""
@@ -1033,6 +1109,7 @@ class ClaudeAgent(Agent):
         argv = [self.opts.claude, "-p", "--verbose",
             "--input-format", "stream-json",
             "--output-format", "stream-json",
+            "--include-partial-messages",
             "--permission-mode", "manual",
             "--permission-prompt-tool", "stdio",
             "--disallowed-tools", "AskUserQuestion",
@@ -1251,6 +1328,7 @@ class ClaudeAgent(Agent):
             self.asked["from"] = author
             self.typing(False)
             self.tell(who, self.question(ask["request"]))
+            self.speak_note(VOICE_ASKING)
 
     def allow(self, ask):
         self.respond(ask["id"], {"behavior": "allow",
@@ -1309,6 +1387,8 @@ class ClaudeAgent(Agent):
         if kind == "system":
             if rec.get("subtype") == "init":
                 self.on_init(rec)
+        elif kind == "stream_event":
+            self.on_stream(rec)
         elif kind == "assistant":
             self.on_assistant(rec)
         elif kind == "result":
@@ -1327,6 +1407,15 @@ class ClaudeAgent(Agent):
         if not self.ready:
             self.ready = True
             self.remember(self.session_id)
+
+    def on_stream(self, rec):
+        event = rec.get("event") or {}
+        delta = event.get("delta") or {}
+
+        if not rec.get("parent_tool_use_id") and \
+            event.get("type") == "content_block_delta" and \
+            delta.get("type") == "text_delta":
+            self.speak_text(delta.get("text"))
 
     def on_assistant(self, rec):
         if rec.get("parent_tool_use_id"):
@@ -1611,6 +1700,395 @@ class Renderer(Worker):
         self.chat.rendered(msg, self.image(), error)
 
 
+class LiveChild:
+    """
+    A child that lives as long as a call does, with both of its pipes on the
+    loop of the chat. Nothing here may block, because the call stutters if it
+    does: what the child cannot take yet waits, and what it does not take for
+    too long is dropped.
+    """
+
+    def __init__(self, chat, argv, on_data):
+        self.chat = chat
+        self.on_data = on_data
+        self.out = bytearray()
+        self.gone = False
+        self.proc = subprocess.Popen(argv, bufsize=0,
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.fd = self.proc.stdout.fileno()
+        self.ifd = self.proc.stdin.fileno()
+
+        os.set_blocking(self.fd, False)
+        os.set_blocking(self.ifd, False)
+        chat.add_reader(self.fd, self.on_output)
+
+    def write(self, data, droppable=False):
+        if droppable and len(self.out) + len(data) > VOICE_BACKLOG:
+            del self.out[:len(data)]
+
+        self.out += data
+        self.flush()
+
+    def flush(self):
+        if self.gone or not self.out:
+            return
+
+        try:
+            del self.out[:os.write(self.ifd, self.out)]
+        except BlockingIOError:
+            pass
+        except OSError:
+            self.gone = True
+
+    def on_output(self, source):
+        try:
+            data = os.read(source, 65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+
+        if data:
+            self.on_data(data)
+        else:
+            self.gone = True
+            self.chat.remove_reader(self.fd)
+
+    def close(self):
+        self.chat.remove_reader(self.fd)
+        self.proc.kill()
+        self.proc.wait()
+        self.proc.stdin.close()
+        self.proc.stdout.close()
+        self.gone = True
+
+
+class Voice:
+    """
+    One call with one peer: audio goes to a child that listens and what it
+    hears becomes a prompt, answers go to a child that speaks and what it says
+    goes to the call. The chat keeps getting the whole answer, this only
+    says it out loud, so whatever does not sound right can be left out.
+
+    Talking over it stops it talking. What was said then is simply the next
+    message, it does not stop the agent working, /abort in the chat does that.
+    """
+
+    def __init__(self, chat, call, opts, hear=None, speak=None):
+        self.chat = chat
+        self.call = call
+        self.opts = opts
+        self.hear = hear or LiveChild(chat, shlex.split(opts.hear),
+            self.on_heard)
+
+        try:
+            self.speak = speak or LiveChild(chat, shlex.split(opts.speak),
+                self.on_spoken)
+        except OSError:
+            self.hear.close()
+            raise
+
+        self.deadline = time.monotonic() + VOICE_READY
+
+        self.heard_buf = b""
+        self.spoken_buf = b""
+        self.heard_ready = False
+        self.speak_ready = False
+        self.listening = False
+
+        self.turns = []
+        self.agent = None
+        self.text = ""
+        self.in_code = False
+        self.budget = VOICE_SAY_MAX
+        self.lines = []
+        self.saying = None
+        self.next_id = 0
+        self.said = []
+        self.cut = None
+        self.hushed = False
+        self.worked = 0
+        self.gave_up = False
+
+    def owns(self, msg):
+        return msg is not None and any(msg is turn for turn in self.turns)
+
+    #
+    # The child that listens.
+    #
+
+    def on_heard(self, data):
+        self.heard_buf += data
+
+        while b"\n" in self.heard_buf:
+            line, self.heard_buf = self.heard_buf.split(b"\n", 1)
+
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                log("%02x: the listener said %r" % (self.call.peer.id,
+                    line[:80]))
+                continue
+
+            if rec.get("ready"):
+                self.heard_ready = True
+                self.check_ready()
+            elif rec.get("speech"):
+                self.interrupted()
+            elif "text" in rec:
+                self.listening = False
+                self.prompt((rec["text"] or "").strip())
+
+    def check_ready(self):
+        if self.heard_ready and self.speak_ready and \
+            self.call.state == "ringing":
+            self.call.answer()
+
+    def interrupted(self):
+        """They started talking, so we stop and work out what they heard."""
+
+        self.listening = True
+
+        if self.saying is None and not self.lines and not self.call.queued:
+            return
+
+        total = sum(ms for _, ms in self.said)
+
+        if self.saying is not None:
+            total += self.saying[2] * pygospel.VOICE_INTERVAL // \
+                pygospel.VOICE_BYTES
+
+        played = total - self.call.queued
+        last = None
+
+        for line, ms in self.said:
+            if played < ms:
+                break
+
+            played -= ms
+            last = line
+
+        self.cut = VOICE_CUT % last if last else VOICE_CUT_NONE
+        self.hushed = self.working()
+        self.call.clear_audio()
+        self.saying = None
+        self.lines = []
+        self.said = []
+        self.text = ""
+
+    def prompt(self, text):
+        if not any(c.isalnum() for c in text):
+            return
+
+        peer = self.call.peer.id
+
+        # No text to hash, nothing in the chat has this to quote.
+        msg = pygospel.Message("", peer=peer)
+        msg.text = VOICE_PROMPT % (self.cut or "", text)
+        self.cut = None
+
+        log("%02x said %r" % (peer, text))
+
+        self.turns.append(msg)
+        self.agent = self.chat.conversation(msg)
+        self.agent.voice = self
+        self.chat.on_message(msg)
+
+    #
+    # The child that speaks.
+    #
+
+    def add(self, text):
+        """More of the answer, of which we say each sentence as it is whole."""
+
+        if self.hushed:
+            return
+
+        self.text += text
+
+        while True:
+            if self.in_code:
+                end = self.text.find("```")
+
+                if end < 0:
+                    self.text = self.text[-2:]
+                    return
+
+                self.text = self.text[end + 3:]
+                self.in_code = False
+                continue
+
+            fence = self.text.find("```")
+            head = self.text if fence < 0 else self.text[:fence]
+            match = re.search(r"[.!?]+(?=\s)|\n", head)
+
+            if match is not None:
+                self.line(self.text[:match.end()])
+                self.text = self.text[match.end():]
+                continue
+
+            if fence >= 0:
+                self.line(head)
+                self.note(VOICE_CODE)
+                self.text = self.text[fence + 3:]
+                self.in_code = True
+                continue
+
+            if len(self.text) > VOICE_LINE_MAX:
+                cut = self.text.rfind(" ", 0, VOICE_LINE_MAX) + 1 or \
+                    VOICE_LINE_MAX
+                self.line(self.text[:cut])
+                self.text = self.text[cut:]
+                continue
+
+            return
+
+    def line(self, text):
+        text = speakable(text)
+
+        if not text or self.budget <= 0:
+            return
+
+        self.budget -= len(text)
+        self.lines.append(text)
+
+        if self.budget <= 0:
+            self.lines.append(VOICE_REST)
+
+        self.pump()
+
+    def note(self, text):
+        if text not in self.lines:
+            self.lines.append(text)
+
+        self.pump()
+
+    def finish_turn(self):
+        """The turn is over, so whatever is left is a sentence by itself."""
+
+        if not self.in_code and not self.hushed:
+            self.line(self.text)
+
+        self.text = ""
+        self.in_code = False
+        self.hushed = False
+        self.budget = VOICE_SAY_MAX
+
+    def pump(self):
+        """One sentence at a time, or talking over it would have to wait."""
+
+        if self.saying is not None or not self.lines or not self.speak_ready:
+            return
+
+        self.next_id += 1
+        self.saying = [self.next_id, self.lines.pop(0), 0]
+        self.speak.write(json.dumps({"id": self.saying[0],
+            "text": self.saying[1]}).encode("utf-8") + b"\n")
+
+    def on_spoken(self, data):
+        self.spoken_buf += data
+
+        while len(self.spoken_buf) >= VOICE_HEAD.size:
+            id, size = VOICE_HEAD.unpack_from(self.spoken_buf)
+
+            if len(self.spoken_buf) < VOICE_HEAD.size + size:
+                return
+
+            pcm = self.spoken_buf[VOICE_HEAD.size:VOICE_HEAD.size + size]
+            self.spoken_buf = self.spoken_buf[VOICE_HEAD.size + size:]
+            self.spoken(id, pcm)
+
+    def spoken(self, id, pcm):
+        if id == 0:
+            self.speak_ready = True
+            self.check_ready()
+            return
+
+        # Whatever we were saying when they interrupted us stays unsaid.
+        if self.saying is None or self.saying[0] != id:
+            return
+
+        if pcm:
+            self.saying[2] += len(pcm)
+
+            try:
+                self.call.send_audio(pcm)
+            except pygospel.GospelError as e:
+                log("%02x: not saying that: %s" % (self.call.peer.id, e))
+
+            return
+
+        # A call only sends whole frames, the end of this would wait forever.
+        rest = -self.saying[2] % pygospel.VOICE_BYTES
+
+        if rest:
+            self.saying[2] += rest
+            self.call.send_audio(bytes(rest))
+
+        self.said.append((self.saying[1], self.saying[2] *
+            pygospel.VOICE_INTERVAL // pygospel.VOICE_BYTES))
+        self.saying = None
+        self.pump()
+
+    #
+    # The call.
+    #
+
+    def talking(self):
+        self.note(VOICE_HELLO)
+
+    def audio(self, pcm):
+        self.hear.write(pcm, droppable=True)
+
+    def working(self):
+        return self.agent is not None and self.agent.busy and \
+            self.owns(self.agent.running)
+
+    def tick(self, now):
+        self.hear.flush()
+        self.speak.flush()
+
+        if self.saying is None and not self.lines and not self.call.queued:
+            self.said = []
+
+        if self.gave_up:
+            return
+
+        if self.hear.gone or self.speak.gone:
+            self.give_up("the %s went away" % ("listener" if self.hear.gone
+                else "voice"))
+            return
+
+        if self.call.state == "ringing" and now >= self.deadline:
+            self.give_up("the speech models did not load in time")
+            return
+
+        if self.working() and not self.listening and self.saying is None \
+            and not self.lines and not self.call.queued and \
+            now - self.worked >= WORKING_EVERY:
+            self.worked = now
+            self.call.send_audio(self.chat.working_sound)
+
+    def give_up(self, why):
+        self.gave_up = True
+
+        log("%02x: hanging up, %s" % (self.call.peer.id, why))
+
+        try:
+            self.chat.send(self.call.peer.id, "I hung up, %s" % why)
+        except pygospel.GospelError as e:
+            log("%02x: cannot send: %s" % (self.call.peer.id, e))
+
+        self.call.hangup()
+
+    def close(self):
+        if self.agent is not None:
+            self.agent.voice = None
+
+        self.hear.close()
+        self.speak.close()
+
+
 class AgentChat(pygospel.GospelChat):
     """A gospel chat whose replies come from agent sessions."""
 
@@ -1621,6 +2099,11 @@ class AgentChat(pygospel.GospelChat):
         self.agents = {}
         self.voices = None
         self.renders = None
+        self.voice = None
+        self.working_sound = b"".join(struct.pack("<h", int(WORKING_LEVEL *
+            math.sin(2 * math.pi * WORKING_HZ * n / 48000) *
+            math.sin(math.pi * n / WORKING_LEN)))
+            for n in range(WORKING_LEN))
 
         if opts.transcribe:
             self.voices = Transcriber(self, shlex.split(opts.transcribe))
@@ -1630,7 +2113,43 @@ class AgentChat(pygospel.GospelChat):
 
         super().__init__(config, nickname=nickname, group=opts.group,
             signal_all=opts.signal_all, take_data=True,
-            discoverable=opts.liturgy is not None)
+            discoverable=opts.liturgy is not None,
+            take_calls=bool(opts.hear))
+
+    def on_call_ring(self, call):
+        """Whoever may talk to us may call us, once our models are loaded."""
+
+        id = call.peer.id
+
+        if self.opts.allow is not None and id not in self.opts.allow:
+            log("%02x is calling, and is not in --allow" % id)
+            call.hangup()
+            return
+
+        log("%02x is calling, loading the speech models" % id)
+
+        try:
+            self.voice = Voice(self, call, self.opts)
+        except OSError as e:
+            log("%02x: cannot take the call: %s" % (id, e))
+            call.hangup()
+
+    def on_call_talking(self, call):
+        log("%02x is on the line, via %s" % (call.peer.id, call.link))
+
+        if self.voice is not None:
+            self.voice.talking()
+
+    def on_call_audio(self, call, pcm):
+        if self.voice is not None:
+            self.voice.audio(pcm)
+
+    def on_call_end(self, call, reason):
+        log("%02x: call ended, %s" % (call.peer.id, reason))
+
+        if self.voice is not None:
+            self.voice.close()
+            self.voice = None
 
     def on_message(self, msg):
         text = msg.text.strip()
@@ -1727,8 +2246,8 @@ class AgentChat(pygospel.GospelChat):
         log("%s wants an image of %r" % (msg.where, prompt))
 
         if self.renders.busy():
-            self.say(msg, "drawing something else first, %d ahead of this"
-                % (len(self.renders.queue) + 1))
+            self.say(msg, "Queued, %d ahead of this" %
+                (len(self.renders.queue) + 1))
 
         self.renders.add((msg, prompt))
 
@@ -1904,11 +2423,17 @@ class AgentChat(pygospel.GospelChat):
         if self.renders is not None:
             self.renders.check(now)
 
+        if self.voice is not None:
+            self.voice.tick(now)
+
         for key in list(self.agents):
             agent = self.agents[key]
 
             agent.flush(now)
             agent.check_stats(now)
+
+            if self.voice is not None and agent is self.voice.agent:
+                continue
 
             if agent.gone or agent.expired(now):
                 agent.close()
@@ -1980,6 +2505,12 @@ def main():
     ap.add_argument("--transcribe",
         help="a command that prints the words of the audio file it is given "
         "as its last argument, see tools/transcribe.py")
+    ap.add_argument("--hear",
+        help="a command that listens to a call, needed to take calls, see "
+        "tools/hear.py")
+    ap.add_argument("--speak",
+        help="a command that talks on a call, needed to take calls, see "
+        "tools/speak.py")
     ap.add_argument("--render",
         help="a command that answers !render, it reads the prompt on stdin "
         "and writes a PNG to the path given as its last argument, see "
@@ -2008,6 +2539,9 @@ def main():
     if args.liturgy is not None:
         args.signal_all = False
 
+    if bool(args.hear) != bool(args.speak):
+        sys.exit("taking calls needs both --hear and --speak")
+
     try:
         config = pygospel.GospelConfig.load(args.config)
 
@@ -2035,6 +2569,10 @@ def main():
 
     if chat.presence is not None:
         log("a peer in liturgy_group %04x" % config.group)
+
+    if args.hear:
+        log("taking calls%s" % ("" if chat.presence is not None
+            else ", a Vigil will not list us without --liturgy"))
 
     try:
         chat.run()

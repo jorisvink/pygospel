@@ -11,12 +11,12 @@ It speaks gospel over sanctum tunnels, it is compatible with
 [Vigil](https://github.com/jorisvink/vigil) and with
 the [gospel](https://github.com/jorisvink/gospel) project. It does text both
 ways, sends images and can receive data, see [Images](#images) and
-[Receiving data](#receiving-data). It does no calls. Unless you ask it to take
-data it never announces that it can, so a Vigil peer that has something for
-you sends you a message saying so instead, which is what Vigil already does
-for a peer that cannot take data. The other bit it will set is the signed-name
-bit, and only when it has a name that verifies, see
-[Signed names](#signed-names).
+[Receiving data](#receiving-data). It makes and takes voice calls, see
+[Calls](#calls). Unless you ask it to take data it never announces that it
+can, so a Vigil peer that has something for you sends you a message saying so
+instead, which is what Vigil already does for a peer that cannot take data.
+The other bit it will set is the signed-name bit, and only when it has a name
+that verifies, see [Signed names](#signed-names).
 
 ```python
 import pygospel
@@ -117,7 +117,7 @@ Options that have no bearing on a text chat (routes, dns, a tunnel
 address) are read and ignored. `liturgy_group` is the group calls signal in,
 chats do not use it. It only matters here with `discoverable=True`, which
 puts this device in the list Vigil shows for that group. Vigil then also
-offers to call it, and nothing here answers a call.
+offers to call it, which rings here with `take_calls=True`, see [Calls](#calls).
 
 # One-to-one chats
 
@@ -344,7 +344,8 @@ $ PYTHONPATH=build/host/libkyrka/obj/python python3 examples/chatter.py -c gospe
 `chatter.py` is a terminal client with a prompt, `/to 02` and `/join 0007`
 to point it at a device or a group. `echo.py` is the smallest thing that
 works, about twenty lines on top of `GospelChat`. `presence.py` watches the
-flock and says who is reachable and how.
+flock and says who is reachable and how. `call.py` answers or makes a voice
+call and sends back what it hears, see [Calls](#calls).
 
 `agent.py` is a peer rather than a client: it hands whatever a device sends
 it to a `pi --mode rpc` child, one per conversation and one session each,
@@ -360,29 +361,57 @@ its answer. The path is relative to `--dir` and has to stay inside it.
 Images and files sent to an agent are kept under
 `~/.local/state/vigil-python/inbox`, and the agent is told where. They stay
 there until you remove them. A voice message becomes a prompt with
-`--transcribe`, a command that prints the words of the audio file it is given:
+`--transcribe`, a command that prints the words of the audio file it is given,
+see [Requirements](#requirements):
 
 ```
-$ python3 -m venv ~/whisper
-$ ~/whisper/bin/pip install faster-whisper 'av<16'
 $ python3 examples/agent.py -c gospel.conf -a 02 \
-    --transcribe "$HOME/whisper/bin/python tools/transcribe.py"
+    --transcribe "$HOME/pygospel/agent/whisper/bin/python tools/transcribe.py"
 ```
 
 That runs on this machine, and the audio is deleted once it has its words. A
 transcript is marked as one, so it cannot run a command or answer a permission
 question. In a group an agent only takes data with `--group-all`.
 
+A device in `--allow` can also call the agent, with `--hear` and `--speak`.
+Both are commands that stay up for the length of a call, and `--liturgy` is what
+gets the agent listed as online. Everything runs on this machine, the audio is
+only ever in memory, and the models load while the call rings. Install them
+with [`make requirements`](#requirements):
+
+```
+$ AGENT=$HOME/pygospel/agent
+$ HF_HOME=$AGENT/huggingface PYTHONPATH=build/host/libkyrka/obj/python \
+    $AGENT/venv/bin/python examples/agent.py -c gospel.conf -a 02 --liturgy \
+    --hear "$AGENT/whisper/bin/python tools/hear.py" \
+    --speak "$AGENT/piper/bin/python tools/speak.py \
+    $AGENT/piper/en_US-lessac-medium.onnx"
+```
+
+What you say is a prompt in the same conversation as your chat, and the answer
+is spoken as the agent writes it, one sentence at a time. It also goes to the
+chat as usual, so nothing is lost by what speech leaves out: code, images and
+anything past the first 1200 characters. A soft sound every few seconds means
+it is working.
+
+Talking over it stops it talking, and it gets told how far you heard. What you
+said is then the next message, so it does not stop the agent working, `/abort`
+in the chat does that. A transcript cannot run a command or answer a question:
+when it needs your permission it says so, and you type the answer in the chat.
+
+`tools/hear.py` takes `--language`, worth setting because a few spoken words are
+not much to detect one from, and `--device cuda --compute float16` for a GPU.
+The voice speaks the one language it was made for, so pick a voice to match.
+
 `!render <prompt>` draws an image and sends it back, without involving the
 agent. It needs `--render`, a command that reads the prompt on stdin and writes
 a PNG to the path it is given as its last argument. `tools/render.py` does that
-with Z-Image-Turbo on a GPU, downloading the models the first time:
+with Z-Image-Turbo on a GPU, downloading the models the first time, see
+[Requirements](#requirements):
 
 ```
-$ python3 -m venv ~/render
-$ ~/render/bin/pip install torch diffusers transformers accelerate gguf
 $ python3 examples/agent.py -c gospel.conf -a 02 \
-    --render "$HOME/render/bin/python tools/render.py"
+    --render "$HOME/pygospel/agent/render/bin/python tools/render.py"
 ```
 
 Only devices in `--allow` can ask, one image is drawn at a time, and a group
@@ -422,6 +451,58 @@ one-to-one chat, it joins a group chat and answers what mentions it. Add
 `--no-signal-all` if it should only be seen in that group. A device outside
 the `liturgy_group` can still open a chat by id, the flock is what admits it
 and `--allow` is what gets it an answer.
+
+# Calls
+
+Voice calls need [opuslib](https://pypi.org/project/opuslib/) and libopus, and
+nothing else in here does, [`make requirements`](#requirements) installs it. Audio is 16 bit signed mono PCM at 48 kHz. There is
+one call at a time, and a device calling during it waits until it is over.
+
+```python
+class Phone(pygospel.GospelChat):
+    def on_call_ring(self, call):
+        call.answer()
+
+    def on_call_audio(self, call, pcm):
+        call.send_audio(pcm)
+
+    def on_call_end(self, call, reason):
+        print("%02x: %s" % (call.peer.id, reason))
+
+Phone("gospel.conf", take_calls=True, discoverable=True).run()
+```
+
+Vigil only offers to call a device it counts as online, which is what
+`discoverable` is for, and both sides need the same `liturgy_group`. The devices
+we see there are in `chat.callable`, so an empty one means no Vigil is in that
+group. `examples/call.py --liturgy 0007` says this as it happens.
+
+`on_call_ring` fires once the tunnel to the caller is up, which is the proof
+of who it is, so `call.peer.id` is safe to decide on. It rings until you call
+`call.answer()` or `call.hangup()`, or for 60 seconds.
+
+`chat.call(0x02)` calls a device and returns the same `Call`. It needs no
+`take_calls`, that only decides whether others can ring you.
+
+| | |
+|---|---|
+| `on_call_ring(call)` | a peer proved it is calling us |
+| `on_call_talking(call)` | the first audio arrived |
+| `on_call_audio(call, pcm)` | 20 ms of audio, lost frames already repaired |
+| `on_call_end(call, reason)` | `local`, `remote`, `timeout` or `error` |
+
+`call.send_audio(pcm)` takes audio of any length and `call.queued` says how
+many milliseconds still wait, up to five minutes. `call.clear_audio()` drops
+them. A talking call sends fifty frames a second, silence when nothing is
+queued, because a peer takes twenty seconds without one for a dead call.
+
+Those fifty frames depend on `run()` or `poll()` being called, so a hook that
+blocks stutters the call. Do slow work in another process, the way
+`examples/agent.py` does. `examples/call.py` answers or makes a call and sends
+back what it hears.
+
+If two devices call each other at the same moment neither rings, and both give
+up after 60 seconds. Video is not supported, and a video frame is ignored.
 
 # How it reaches the network
 
@@ -501,6 +582,8 @@ Your neighborhood LLM
 | `examples/` | a terminal client, an echo bot, a flock watcher, an agent peer |
 | `tools/cathedral/` | fetches sanctum, runs a cathedral, talks to it |
 | `tools/transcribe.py` | the words of an audio file, for agents |
+| `tools/hear.py` | the words of a call as they are said, for agents |
+| `tools/speak.py` | an answer as speech on a call, for agents |
 | `tools/render.py` | an image from a prompt, for agents |
 | `tools/check-style.py` | tabs, alignment and column checks |
 | `tools/align.py` | applies what check-style.py asks for |
