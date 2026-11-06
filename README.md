@@ -454,9 +454,8 @@ and `--allow` is what gets it an answer.
 
 # Calls
 
-Voice calls need [opuslib](https://pypi.org/project/opuslib/) and libopus, and
-nothing else in here does, [`make requirements`](#requirements) installs it. Audio is 16 bit signed mono PCM at 48 kHz. There is
-one call at a time, and a device calling during it waits until it is over.
+Voice calls need [opuslib](https://pypi.org/project/opuslib/) and are
+limited to 1 call at a time.
 
 ```python
 class Phone(pygospel.GospelChat):
@@ -566,10 +565,6 @@ unchanged; it is a test build and a real flock should never point at it.
 Everything the cathedral makes, its keys, ambry, configurations and log,
 goes under `build/cathedral`. `make clean` takes it away along with the
 built module, `make dist-clean` also drops the downloaded tarballs.
-
-# Authorship
-
-Your neighborhood LLM
 
 # Files
 
