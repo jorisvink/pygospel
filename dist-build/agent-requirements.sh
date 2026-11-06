@@ -7,11 +7,11 @@
 #
 
 set -e
-set -x
 
 PYTHON=${PYTHON:-python3}
 ROOTDIR=${REQDIR:-$HOME/.pygospel}
 REQDIR=${REQDIR:-$ROOTDIR/agent}
+LIBDIR=${LIBDIR:-$ROOTDIR/libs}
 TOOLDIR=${TOOLDIR:-$ROOTDIR/tools}
 AGENT_VENV=${AGENT_VENV:-$REQDIR/venv}
 HF_HOME=${HF_HOME:-$REQDIR/huggingface}
@@ -74,6 +74,9 @@ cp tools/render.py $TOOLDIR
 cp tools/transcribe.py $TOOLDIR
 
 cp examples/agent.py $REQDIR
+
+mkdir -p $LIBDIR
+cp build/host/libkyrka/obj/python/libkyrka.so $LIBDIR
 
 cat << EOF
 
