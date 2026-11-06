@@ -37,6 +37,8 @@ $ make
 $ make test
 ```
 
+Make sure you have python3-dev or equivalent installed.
+
 `make` downloads libkyrka, checks its checksum, unpacks it under `build/`
 and applies `dist-build/patches`. It needs the python3 development headers
 and libsodium (libkyrka gets AES-GCM, x25519 and ed25519 from it). If you
